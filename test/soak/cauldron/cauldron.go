@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,12 +29,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/errors"
+	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
 var (
@@ -45,12 +44,13 @@ var (
 )
 
 const (
-	deleteTimeout        = 2 * time.Minute
-	endpointTimeout      = 5 * time.Minute
-	nodeListTimeout      = 2 * time.Minute
-	podCreateTimeout     = 2 * time.Minute
-	podStartTimeout      = 30 * time.Minute
-	serviceCreateTimeout = 2 * time.Minute
+	deleteTimeout          = 2 * time.Minute
+	endpointTimeout        = 5 * time.Minute
+	nodeListTimeout        = 2 * time.Minute
+	podCreateTimeout       = 2 * time.Minute
+	podStartTimeout        = 30 * time.Minute
+	serviceCreateTimeout   = 2 * time.Minute
+	namespaceDeleteTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -66,7 +66,7 @@ func main() {
 
 	var nodes *api.NodeList
 	for start := time.Now(); time.Since(start) < nodeListTimeout; time.Sleep(2 * time.Second) {
-		nodes, err = c.Nodes().List(labels.Everything(), fields.Everything())
+		nodes, err = c.Nodes().List(api.ListOptions{})
 		if err == nil {
 			break
 		}
@@ -96,6 +96,16 @@ func main() {
 	defer func(ns string) {
 		if err := c.Namespaces().Delete(ns); err != nil {
 			glog.Warningf("Failed to delete namespace ns: %e", ns, err)
+		} else {
+			// wait until the namespace disappears
+			for i := 0; i < int(namespaceDeleteTimeout/time.Second); i++ {
+				if _, err := c.Namespaces().Get(ns); err != nil {
+					if errors.IsNotFound(err) {
+						return
+					}
+				}
+				time.Sleep(time.Second)
+			}
 		}
 	}(ns)
 	glog.Infof("Created namespace %s", ns)
@@ -117,7 +127,7 @@ func main() {
 				Ports: []api.ServicePort{{
 					Protocol:   "TCP",
 					Port:       9376,
-					TargetPort: util.NewIntOrStringFromInt(9376),
+					TargetPort: intstr.FromInt(9376),
 				}},
 				Selector: map[string]string{
 					"name": "serve-hostname",
@@ -167,7 +177,7 @@ func main() {
 						Containers: []api.Container{
 							{
 								Name:  "serve-hostname",
-								Image: "gcr.io/google_containers/serve_hostname:1.1",
+								Image: "gcr.io/google_containers/serve_hostname:v1.4",
 								Ports: []api.ContainerPort{{ContainerPort: 9376}},
 							},
 						},

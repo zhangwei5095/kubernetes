@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,25 +20,27 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	versioned "github.com/GoogleCloudPlatform/kubernetes/pkg/api/v1"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/resource"
+	versioned "k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
 func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
-	data, err := versioned.Codec.Encode(obj)
+	codec := api.Codecs.LegacyCodec(versioned.SchemeGroupVersion)
+	data, err := runtime.Encode(codec, obj)
 	if err != nil {
 		t.Errorf("%v\n %#v", err, obj)
 		return nil
 	}
-	obj2, err := api.Codec.Decode(data)
+	obj2, err := runtime.Decode(codec, data)
 	if err != nil {
 		t.Errorf("%v\nData: %s\nSource: %#v", err, string(data), obj)
 		return nil
 	}
 	obj3 := reflect.New(reflect.TypeOf(obj).Elem()).Interface().(runtime.Object)
-	err = api.Scheme.Convert(obj2, obj3)
+	err = api.Scheme.Convert(obj2, obj3, nil)
 	if err != nil {
 		t.Errorf("%v\nSource: %#v", err, obj2)
 		return nil
@@ -155,8 +157,8 @@ func TestSetDefaultReplicationController(t *testing.T) {
 	}
 }
 
-func newInt(val int) *int {
-	p := new(int)
+func newInt(val int32) *int32 {
+	p := new(int32)
 	*p = val
 	return p
 }
@@ -164,7 +166,7 @@ func newInt(val int) *int {
 func TestSetDefaultReplicationControllerReplicas(t *testing.T) {
 	tests := []struct {
 		rc             versioned.ReplicationController
-		expectReplicas int
+		expectReplicas int32
 	}{
 		{
 			rc: versioned.ReplicationController{
@@ -240,6 +242,72 @@ func TestSetDefaultService(t *testing.T) {
 	}
 }
 
+func TestSetDefaultSecretVolumeSource(t *testing.T) {
+	s := versioned.PodSpec{}
+	s.Volumes = []versioned.Volume{
+		{
+			VolumeSource: versioned.VolumeSource{
+				Secret: &versioned.SecretVolumeSource{},
+			},
+		},
+	}
+	pod := &versioned.Pod{
+		Spec: s,
+	}
+	output := roundTrip(t, runtime.Object(pod))
+	pod2 := output.(*versioned.Pod)
+	defaultMode := pod2.Spec.Volumes[0].VolumeSource.Secret.DefaultMode
+	expectedMode := versioned.SecretVolumeSourceDefaultMode
+
+	if defaultMode == nil || *defaultMode != expectedMode {
+		t.Errorf("Expected secret DefaultMode %v, got %v", expectedMode, defaultMode)
+	}
+}
+
+func TestSetDefaultConfigMapVolumeSource(t *testing.T) {
+	s := versioned.PodSpec{}
+	s.Volumes = []versioned.Volume{
+		{
+			VolumeSource: versioned.VolumeSource{
+				ConfigMap: &versioned.ConfigMapVolumeSource{},
+			},
+		},
+	}
+	pod := &versioned.Pod{
+		Spec: s,
+	}
+	output := roundTrip(t, runtime.Object(pod))
+	pod2 := output.(*versioned.Pod)
+	defaultMode := pod2.Spec.Volumes[0].VolumeSource.ConfigMap.DefaultMode
+	expectedMode := versioned.ConfigMapVolumeSourceDefaultMode
+
+	if defaultMode == nil || *defaultMode != expectedMode {
+		t.Errorf("Expected ConfigMap DefaultMode %v, got %v", expectedMode, defaultMode)
+	}
+}
+
+func TestSetDefaultDownwardAPIVolumeSource(t *testing.T) {
+	s := versioned.PodSpec{}
+	s.Volumes = []versioned.Volume{
+		{
+			VolumeSource: versioned.VolumeSource{
+				DownwardAPI: &versioned.DownwardAPIVolumeSource{},
+			},
+		},
+	}
+	pod := &versioned.Pod{
+		Spec: s,
+	}
+	output := roundTrip(t, runtime.Object(pod))
+	pod2 := output.(*versioned.Pod)
+	defaultMode := pod2.Spec.Volumes[0].VolumeSource.DownwardAPI.DefaultMode
+	expectedMode := versioned.DownwardAPIVolumeSourceDefaultMode
+
+	if defaultMode == nil || *defaultMode != expectedMode {
+		t.Errorf("Expected DownwardAPI DefaultMode %v, got %v", expectedMode, defaultMode)
+	}
+}
+
 func TestSetDefaultSecret(t *testing.T) {
 	s := &versioned.Secret{}
 	obj2 := roundTrip(t, runtime.Object(s))
@@ -299,15 +367,15 @@ func TestSetDefaulServiceTargetPort(t *testing.T) {
 	in := &versioned.Service{Spec: versioned.ServiceSpec{Ports: []versioned.ServicePort{{Port: 1234}}}}
 	obj := roundTrip(t, runtime.Object(in))
 	out := obj.(*versioned.Service)
-	if out.Spec.Ports[0].TargetPort != util.NewIntOrStringFromInt(1234) {
-		t.Errorf("Expected TargetPort to be defaulted, got %s", out.Spec.Ports[0].TargetPort)
+	if out.Spec.Ports[0].TargetPort != intstr.FromInt(1234) {
+		t.Errorf("Expected TargetPort to be defaulted, got %v", out.Spec.Ports[0].TargetPort)
 	}
 
-	in = &versioned.Service{Spec: versioned.ServiceSpec{Ports: []versioned.ServicePort{{Port: 1234, TargetPort: util.NewIntOrStringFromInt(5678)}}}}
+	in = &versioned.Service{Spec: versioned.ServiceSpec{Ports: []versioned.ServicePort{{Port: 1234, TargetPort: intstr.FromInt(5678)}}}}
 	obj = roundTrip(t, runtime.Object(in))
 	out = obj.(*versioned.Service)
-	if out.Spec.Ports[0].TargetPort != util.NewIntOrStringFromInt(5678) {
-		t.Errorf("Expected TargetPort to be unchanged, got %s", out.Spec.Ports[0].TargetPort)
+	if out.Spec.Ports[0].TargetPort != intstr.FromInt(5678) {
+		t.Errorf("Expected TargetPort to be unchanged, got %v", out.Spec.Ports[0].TargetPort)
 	}
 }
 
@@ -315,43 +383,43 @@ func TestSetDefaultServicePort(t *testing.T) {
 	// Unchanged if set.
 	in := &versioned.Service{Spec: versioned.ServiceSpec{
 		Ports: []versioned.ServicePort{
-			{Protocol: "UDP", Port: 9376, TargetPort: util.NewIntOrStringFromString("p")},
-			{Protocol: "UDP", Port: 8675, TargetPort: util.NewIntOrStringFromInt(309)},
+			{Protocol: "UDP", Port: 9376, TargetPort: intstr.FromString("p")},
+			{Protocol: "UDP", Port: 8675, TargetPort: intstr.FromInt(309)},
 		},
 	}}
 	out := roundTrip(t, runtime.Object(in)).(*versioned.Service)
 	if out.Spec.Ports[0].Protocol != versioned.ProtocolUDP {
 		t.Errorf("Expected protocol %s, got %s", versioned.ProtocolUDP, out.Spec.Ports[0].Protocol)
 	}
-	if out.Spec.Ports[0].TargetPort != util.NewIntOrStringFromString("p") {
-		t.Errorf("Expected port %d, got %s", in.Spec.Ports[0].Port, out.Spec.Ports[0].TargetPort)
+	if out.Spec.Ports[0].TargetPort != intstr.FromString("p") {
+		t.Errorf("Expected port %v, got %v", in.Spec.Ports[0].Port, out.Spec.Ports[0].TargetPort)
 	}
 	if out.Spec.Ports[1].Protocol != versioned.ProtocolUDP {
 		t.Errorf("Expected protocol %s, got %s", versioned.ProtocolUDP, out.Spec.Ports[1].Protocol)
 	}
-	if out.Spec.Ports[1].TargetPort != util.NewIntOrStringFromInt(309) {
-		t.Errorf("Expected port %d, got %s", in.Spec.Ports[1].Port, out.Spec.Ports[1].TargetPort)
+	if out.Spec.Ports[1].TargetPort != intstr.FromInt(309) {
+		t.Errorf("Expected port %v, got %v", in.Spec.Ports[1].Port, out.Spec.Ports[1].TargetPort)
 	}
 
 	// Defaulted.
 	in = &versioned.Service{Spec: versioned.ServiceSpec{
 		Ports: []versioned.ServicePort{
-			{Protocol: "", Port: 9376, TargetPort: util.NewIntOrStringFromString("")},
-			{Protocol: "", Port: 8675, TargetPort: util.NewIntOrStringFromInt(0)},
+			{Protocol: "", Port: 9376, TargetPort: intstr.FromString("")},
+			{Protocol: "", Port: 8675, TargetPort: intstr.FromInt(0)},
 		},
 	}}
 	out = roundTrip(t, runtime.Object(in)).(*versioned.Service)
 	if out.Spec.Ports[0].Protocol != versioned.ProtocolTCP {
 		t.Errorf("Expected protocol %s, got %s", versioned.ProtocolTCP, out.Spec.Ports[0].Protocol)
 	}
-	if out.Spec.Ports[0].TargetPort != util.NewIntOrStringFromInt(in.Spec.Ports[0].Port) {
-		t.Errorf("Expected port %d, got %d", in.Spec.Ports[0].Port, out.Spec.Ports[0].TargetPort)
+	if out.Spec.Ports[0].TargetPort != intstr.FromInt(int(in.Spec.Ports[0].Port)) {
+		t.Errorf("Expected port %v, got %v", in.Spec.Ports[0].Port, out.Spec.Ports[0].TargetPort)
 	}
 	if out.Spec.Ports[1].Protocol != versioned.ProtocolTCP {
 		t.Errorf("Expected protocol %s, got %s", versioned.ProtocolTCP, out.Spec.Ports[1].Protocol)
 	}
-	if out.Spec.Ports[1].TargetPort != util.NewIntOrStringFromInt(in.Spec.Ports[1].Port) {
-		t.Errorf("Expected port %d, got %d", in.Spec.Ports[1].Port, out.Spec.Ports[1].TargetPort)
+	if out.Spec.Ports[1].TargetPort != intstr.FromInt(int(in.Spec.Ports[1].Port)) {
+		t.Errorf("Expected port %v, got %v", in.Spec.Ports[1].Port, out.Spec.Ports[1].TargetPort)
 	}
 }
 
@@ -366,7 +434,7 @@ func TestSetDefaultNamespace(t *testing.T) {
 }
 
 func TestSetDefaultPodSpecHostNetwork(t *testing.T) {
-	portNum := 8080
+	portNum := int32(8080)
 	s := versioned.PodSpec{}
 	s.HostNetwork = true
 	s.Containers = []versioned.Container{
@@ -405,6 +473,80 @@ func TestSetDefaultNodeExternalID(t *testing.T) {
 	}
 }
 
+func TestSetDefaultNodeStatusAllocatable(t *testing.T) {
+	capacity := versioned.ResourceList{
+		versioned.ResourceCPU:    resource.MustParse("1000m"),
+		versioned.ResourceMemory: resource.MustParse("10G"),
+	}
+	allocatable := versioned.ResourceList{
+		versioned.ResourceCPU:    resource.MustParse("500m"),
+		versioned.ResourceMemory: resource.MustParse("5G"),
+	}
+	tests := []struct {
+		capacity            versioned.ResourceList
+		allocatable         versioned.ResourceList
+		expectedAllocatable versioned.ResourceList
+	}{{ // Everything set, no defaulting.
+		capacity:            capacity,
+		allocatable:         allocatable,
+		expectedAllocatable: allocatable,
+	}, { // Allocatable set, no defaulting.
+		capacity:            nil,
+		allocatable:         allocatable,
+		expectedAllocatable: allocatable,
+	}, { // Capacity set, allocatable defaults to capacity.
+		capacity:            capacity,
+		allocatable:         nil,
+		expectedAllocatable: capacity,
+	}, { // Nothing set, allocatable "defaults" to capacity.
+		capacity:            nil,
+		allocatable:         nil,
+		expectedAllocatable: nil,
+	}}
+
+	copyResourceList := func(rl versioned.ResourceList) versioned.ResourceList {
+		if rl == nil {
+			return nil
+		}
+		copy := make(versioned.ResourceList, len(rl))
+		for k, v := range rl {
+			copy[k] = *v.Copy()
+		}
+		return copy
+	}
+
+	resourceListsEqual := func(a versioned.ResourceList, b versioned.ResourceList) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k, v := range a {
+			vb, found := b[k]
+			if !found {
+				return false
+			}
+			if v.Cmp(vb) != 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	for i, testcase := range tests {
+		node := versioned.Node{
+			Status: versioned.NodeStatus{
+				Capacity:    copyResourceList(testcase.capacity),
+				Allocatable: copyResourceList(testcase.allocatable),
+			},
+		}
+		node2 := roundTrip(t, runtime.Object(&node)).(*versioned.Node)
+		actual := node2.Status.Allocatable
+		expected := testcase.expectedAllocatable
+		if !resourceListsEqual(expected, actual) {
+			t.Errorf("[%d] Expected NodeStatus.Allocatable: %+v; Got: %+v", i, expected, actual)
+		}
+	}
+}
+
 func TestSetDefaultObjectFieldSelectorAPIVersion(t *testing.T) {
 	s := versioned.PodSpec{
 		Containers: []versioned.Container{
@@ -429,5 +571,146 @@ func TestSetDefaultObjectFieldSelectorAPIVersion(t *testing.T) {
 	apiVersion := s2.Containers[0].Env[0].ValueFrom.FieldRef.APIVersion
 	if apiVersion != "v1" {
 		t.Errorf("Expected default APIVersion v1, got: %v", apiVersion)
+	}
+}
+
+func TestSetDefaultRequestsPod(t *testing.T) {
+	// verify we default if limits are specified (and that request=0 is preserved)
+	s := versioned.PodSpec{}
+	s.Containers = []versioned.Container{
+		{
+			Resources: versioned.ResourceRequirements{
+				Requests: versioned.ResourceList{
+					versioned.ResourceMemory: resource.MustParse("0"),
+				},
+				Limits: versioned.ResourceList{
+					versioned.ResourceCPU:    resource.MustParse("100m"),
+					versioned.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+	pod := &versioned.Pod{
+		Spec: s,
+	}
+	output := roundTrip(t, runtime.Object(pod))
+	pod2 := output.(*versioned.Pod)
+	defaultRequest := pod2.Spec.Containers[0].Resources.Requests
+	if requestValue := defaultRequest[versioned.ResourceCPU]; requestValue.String() != "100m" {
+		t.Errorf("Expected request cpu: %s, got: %s", "100m", requestValue.String())
+	}
+	if requestValue := defaultRequest[versioned.ResourceMemory]; requestValue.String() != "0" {
+		t.Errorf("Expected request memory: %s, got: %s", "0", requestValue.String())
+	}
+
+	// verify we do nothing if no limits are specified
+	s = versioned.PodSpec{}
+	s.Containers = []versioned.Container{{}}
+	pod = &versioned.Pod{
+		Spec: s,
+	}
+	output = roundTrip(t, runtime.Object(pod))
+	pod2 = output.(*versioned.Pod)
+	defaultRequest = pod2.Spec.Containers[0].Resources.Requests
+	if requestValue := defaultRequest[versioned.ResourceCPU]; requestValue.String() != "0" {
+		t.Errorf("Expected 0 request value, got: %s", requestValue.String())
+	}
+}
+
+func TestDefaultRequestIsNotSetForReplicationController(t *testing.T) {
+	s := versioned.PodSpec{}
+	s.Containers = []versioned.Container{
+		{
+			Resources: versioned.ResourceRequirements{
+				Limits: versioned.ResourceList{
+					versioned.ResourceCPU: resource.MustParse("100m"),
+				},
+			},
+		},
+	}
+	rc := &versioned.ReplicationController{
+		Spec: versioned.ReplicationControllerSpec{
+			Replicas: newInt(3),
+			Template: &versioned.PodTemplateSpec{
+				ObjectMeta: versioned.ObjectMeta{
+					Labels: map[string]string{
+						"foo": "bar",
+					},
+				},
+				Spec: s,
+			},
+		},
+	}
+	output := roundTrip(t, runtime.Object(rc))
+	rc2 := output.(*versioned.ReplicationController)
+	defaultRequest := rc2.Spec.Template.Spec.Containers[0].Resources.Requests
+	requestValue := defaultRequest[versioned.ResourceCPU]
+	if requestValue.String() != "0" {
+		t.Errorf("Expected 0 request value, got: %s", requestValue.String())
+	}
+}
+
+func TestSetDefaultLimitRangeItem(t *testing.T) {
+	limitRange := &versioned.LimitRange{
+		ObjectMeta: versioned.ObjectMeta{
+			Name: "test-defaults",
+		},
+		Spec: versioned.LimitRangeSpec{
+			Limits: []versioned.LimitRangeItem{{
+				Type: versioned.LimitTypeContainer,
+				Max: versioned.ResourceList{
+					versioned.ResourceCPU: resource.MustParse("100m"),
+				},
+				Min: versioned.ResourceList{
+					versioned.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Default:        versioned.ResourceList{},
+				DefaultRequest: versioned.ResourceList{},
+			}},
+		},
+	}
+
+	output := roundTrip(t, runtime.Object(limitRange))
+	limitRange2 := output.(*versioned.LimitRange)
+	defaultLimit := limitRange2.Spec.Limits[0].Default
+	defaultRequest := limitRange2.Spec.Limits[0].DefaultRequest
+
+	// verify that default cpu was set to the max
+	defaultValue := defaultLimit[versioned.ResourceCPU]
+	if defaultValue.String() != "100m" {
+		t.Errorf("Expected default cpu: %s, got: %s", "100m", defaultValue.String())
+	}
+	// verify that default request was set to the limit
+	requestValue := defaultRequest[versioned.ResourceCPU]
+	if requestValue.String() != "100m" {
+		t.Errorf("Expected request cpu: %s, got: %s", "100m", requestValue.String())
+	}
+	// verify that if a min is provided, it will be the default if no limit is specified
+	requestMinValue := defaultRequest[versioned.ResourceMemory]
+	if requestMinValue.String() != "100Mi" {
+		t.Errorf("Expected request memory: %s, got: %s", "100Mi", requestMinValue.String())
+	}
+}
+
+func TestSetDefaultProbe(t *testing.T) {
+	originalProbe := versioned.Probe{}
+	expectedProbe := versioned.Probe{
+		InitialDelaySeconds: 0,
+		TimeoutSeconds:      1,
+		PeriodSeconds:       10,
+		SuccessThreshold:    1,
+		FailureThreshold:    3,
+	}
+
+	pod := &versioned.Pod{
+		Spec: versioned.PodSpec{
+			Containers: []versioned.Container{{LivenessProbe: &originalProbe}},
+		},
+	}
+
+	output := roundTrip(t, runtime.Object(pod)).(*versioned.Pod)
+	actualProbe := *output.Spec.Containers[0].LivenessProbe
+	if actualProbe != expectedProbe {
+		t.Errorf("Expected probe: %+v\ngot: %+v\n", expectedProbe, actualProbe)
 	}
 }

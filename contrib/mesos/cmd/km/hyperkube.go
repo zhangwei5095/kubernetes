@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
-	"runtime"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/version/verflag"
+	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/logs"
+	"k8s.io/kubernetes/pkg/version/verflag"
 
 	"github.com/spf13/pflag"
 )
@@ -75,8 +75,8 @@ func (hk *HyperKube) Flags() *pflag.FlagSet {
 
 		// These will add all of the "global" flags (defined with both the
 		// flag and pflag packages) to the new flag set we have.
-		util.AddFlagSetToPFlagSet(flag.CommandLine, hk.baseFlags)
-		util.AddPFlagSetToPFlagSet(pflag.CommandLine, hk.baseFlags)
+		hk.baseFlags.AddGoFlagSet(flag.CommandLine)
+		hk.baseFlags.AddFlagSet(pflag.CommandLine)
 
 	}
 	return hk.baseFlags
@@ -152,7 +152,7 @@ func (hk *HyperKube) Run(args []string) error {
 		return err
 	}
 
-	util.AddPFlagSetToPFlagSet(hk.Flags(), s.Flags())
+	s.Flags().AddFlagSet(hk.Flags())
 	err = s.Flags().Parse(args)
 	if err != nil || hk.helpFlagVal {
 		if err != nil {
@@ -164,8 +164,8 @@ func (hk *HyperKube) Run(args []string) error {
 
 	verflag.PrintAndExitIfRequested()
 
-	util.InitLogs()
-	defer util.FlushLogs()
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
 	err = s.Run(s, s.Flags().Args())
 	if err != nil {
@@ -177,7 +177,6 @@ func (hk *HyperKube) Run(args []string) error {
 
 // RunToExit will run the hyperkube and then call os.Exit with an appropriate exit code.
 func (hk *HyperKube) RunToExit(args []string) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	err := hk.Run(args)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())

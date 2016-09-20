@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,19 +20,26 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/fielderrors"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/kubernetes/pkg/api/testapi"
+	apitesting "k8s.io/kubernetes/pkg/api/testing"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/apis/extensions"
+	"k8s.io/kubernetes/pkg/runtime"
+	uexec "k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/kubernetes/pkg/util/validation/field"
 )
 
 func TestMerge(t *testing.T) {
+	grace := int64(30)
 	tests := []struct {
 		obj       runtime.Object
 		fragment  string
@@ -47,15 +54,12 @@ func TestMerge(t *testing.T) {
 					Name: "foo",
 				},
 			},
-			fragment: fmt.Sprintf(`{ "apiVersion": "%s" }`, testapi.Version()),
+			fragment: fmt.Sprintf(`{ "apiVersion": "%s" }`, testapi.Default.GroupVersion().String()),
 			expected: &api.Pod{
 				ObjectMeta: api.ObjectMeta{
 					Name: "foo",
 				},
-				Spec: api.PodSpec{
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSClusterFirst,
-				},
+				Spec: apitesting.DeepEqualSafePodSpec(),
 			},
 		},
 		/* TODO: uncomment this test once Merge is updated to use
@@ -79,7 +83,7 @@ func TestMerge(t *testing.T) {
 					},
 				},
 			},
-			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "containers": [ { "name": "c1", "image": "green-image" } ] } }`, testapi.Version()),
+			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "containers": [ { "name": "c1", "image": "green-image" } ] } }`, testapi.Default.GroupVersion().String()),
 			expected: &api.Pod{
 				ObjectMeta: api.ObjectMeta{
 					Name: "foo",
@@ -105,7 +109,7 @@ func TestMerge(t *testing.T) {
 					Name: "foo",
 				},
 			},
-			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "volumes": [ {"name": "v1"}, {"name": "v2"} ] } }`, testapi.Version()),
+			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "volumes": [ {"name": "v1"}, {"name": "v2"} ] } }`, testapi.Default.GroupVersion().String()),
 			expected: &api.Pod{
 				ObjectMeta: api.ObjectMeta{
 					Name: "foo",
@@ -121,8 +125,10 @@ func TestMerge(t *testing.T) {
 							VolumeSource: api.VolumeSource{EmptyDir: &api.EmptyDirVolumeSource{}},
 						},
 					},
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSClusterFirst,
+					RestartPolicy:                 api.RestartPolicyAlways,
+					DNSPolicy:                     api.DNSClusterFirst,
+					TerminationGracePeriodSeconds: &grace,
+					SecurityContext:               &api.PodSecurityContext{},
 				},
 			},
 		},
@@ -144,7 +150,7 @@ func TestMerge(t *testing.T) {
 			obj: &api.Service{
 				Spec: api.ServiceSpec{},
 			},
-			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "ports": [ { "port": 0 } ] } }`, testapi.Version()),
+			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "ports": [ { "port": 0 } ] } }`, testapi.Default.GroupVersion().String()),
 			expected: &api.Service{
 				Spec: api.ServiceSpec{
 					SessionAffinity: "None",
@@ -167,7 +173,7 @@ func TestMerge(t *testing.T) {
 					},
 				},
 			},
-			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "selector": { "version": "v2" } } }`, testapi.Version()),
+			fragment: fmt.Sprintf(`{ "apiVersion": "%s", "spec": { "selector": { "version": "v2" } } }`, testapi.Default.GroupVersion().String()),
 			expected: &api.Service{
 				Spec: api.ServiceSpec{
 					SessionAffinity: "None",
@@ -181,7 +187,7 @@ func TestMerge(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		out, err := Merge(test.obj, test.fragment, test.kind)
+		out, err := Merge(testapi.Default.Codec(), test.obj, test.fragment, test.kind)
 		if !test.expectErr {
 			if err != nil {
 				t.Errorf("testcase[%d], unexpected error: %v", i, err)
@@ -208,93 +214,160 @@ func (f *fileHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	res.Write(f.data)
 }
 
-func TestReadConfigData(t *testing.T) {
-	httpData := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	server := httptest.NewServer(&fileHandler{data: httpData})
+type checkErrTestCase struct {
+	err          error
+	expectedErr  string
+	expectedCode int
+}
 
-	fileData := []byte{11, 12, 13, 14, 15, 16, 17, 18, 19}
-	f, err := ioutil.TempFile("", "config")
-	if err != nil {
-		t.Errorf("unexpected error setting up config file")
-		t.Fail()
-	}
-	defer syscall.Unlink(f.Name())
-	ioutil.WriteFile(f.Name(), fileData, 0644)
-	// TODO: test TLS here, requires making it possible to inject the HTTP client.
+func TestCheckInvalidErr(t *testing.T) {
+	testCheckError(t, []checkErrTestCase{
+		{
+			errors.NewInvalid(api.Kind("Invalid1"), "invalidation", field.ErrorList{field.Invalid(field.NewPath("field"), "single", "details")}),
+			"The Invalid1 \"invalidation\" is invalid: field: Invalid value: \"single\": details\n",
+			DefaultErrorExitCode,
+		},
+		{
+			errors.NewInvalid(api.Kind("Invalid2"), "invalidation", field.ErrorList{field.Invalid(field.NewPath("field1"), "multi1", "details"), field.Invalid(field.NewPath("field2"), "multi2", "details")}),
+			"The Invalid2 \"invalidation\" is invalid: \n* field1: Invalid value: \"multi1\": details\n* field2: Invalid value: \"multi2\": details\n",
+			DefaultErrorExitCode,
+		},
+		{
+			errors.NewInvalid(api.Kind("Invalid3"), "invalidation", field.ErrorList{}),
+			"The Invalid3 \"invalidation\" is invalid",
+			DefaultErrorExitCode,
+		},
+		{
+			errors.NewInvalid(api.Kind("Invalid4"), "invalidation", field.ErrorList{field.Invalid(field.NewPath("field4"), "multi4", "details"), field.Invalid(field.NewPath("field4"), "multi4", "details")}),
+			"The Invalid4 \"invalidation\" is invalid: field4: Invalid value: \"multi4\": details\n",
+			DefaultErrorExitCode,
+		},
+	})
+}
 
-	tests := []struct {
-		config    string
-		data      []byte
-		expectErr bool
-	}{
+func TestCheckNoResourceMatchError(t *testing.T) {
+	testCheckError(t, []checkErrTestCase{
 		{
-			config: server.URL,
-			data:   httpData,
+			&meta.NoResourceMatchError{PartialResource: unversioned.GroupVersionResource{Resource: "foo"}},
+			`the server doesn't have a resource type "foo"`,
+			DefaultErrorExitCode,
 		},
 		{
-			config:    server.URL + "/error",
-			expectErr: true,
+			&meta.NoResourceMatchError{PartialResource: unversioned.GroupVersionResource{Version: "theversion", Resource: "foo"}},
+			`the server doesn't have a resource type "foo" in version "theversion"`,
+			DefaultErrorExitCode,
 		},
 		{
-			config:    "http://some.non.existent.foobar",
-			expectErr: true,
+			&meta.NoResourceMatchError{PartialResource: unversioned.GroupVersionResource{Group: "thegroup", Version: "theversion", Resource: "foo"}},
+			`the server doesn't have a resource type "foo" in group "thegroup" and version "theversion"`,
+			DefaultErrorExitCode,
 		},
 		{
-			config: f.Name(),
-			data:   fileData,
+			&meta.NoResourceMatchError{PartialResource: unversioned.GroupVersionResource{Group: "thegroup", Resource: "foo"}},
+			`the server doesn't have a resource type "foo" in group "thegroup"`,
+			DefaultErrorExitCode,
 		},
+	})
+}
+
+func TestCheckExitError(t *testing.T) {
+	testCheckError(t, []checkErrTestCase{
 		{
-			config:    "some-non-existent-file",
-			expectErr: true,
+			uexec.CodeExitError{Err: fmt.Errorf("pod foo/bar terminated"), Code: 42},
+			"",
+			42,
 		},
-		{
-			config:    "",
-			expectErr: true,
-		},
+	})
+}
+
+func testCheckError(t *testing.T, tests []checkErrTestCase) {
+	var errReturned string
+	var codeReturned int
+	errHandle := func(err string, code int) {
+		errReturned = err
+		codeReturned = code
 	}
+
 	for _, test := range tests {
-		dataOut, err := ReadConfigData(test.config)
-		if err != nil && !test.expectErr {
-			t.Errorf("unexpected err: %v for %s", err, test.config)
+		checkErr("", test.err, errHandle)
+
+		if errReturned != test.expectedErr {
+			t.Fatalf("Got: %s, expected: %s", errReturned, test.expectedErr)
 		}
-		if err == nil && test.expectErr {
-			t.Errorf("unexpected non-error for %s", test.config)
-		}
-		if !test.expectErr && !reflect.DeepEqual(test.data, dataOut) {
-			t.Errorf("unexpected data: %v, expected %v", dataOut, test.data)
+		if codeReturned != test.expectedCode {
+			t.Fatalf("Got: %d, expected: %d", codeReturned, test.expectedCode)
 		}
 	}
 }
 
-func TestCheckInvalidErr(t *testing.T) {
+func TestDumpReaderToFile(t *testing.T) {
+	testString := "TEST STRING"
+	tempFile, err := ioutil.TempFile("", "hlpers_test_dump_")
+	if err != nil {
+		t.Errorf("unexpected error setting up a temporary file %v", err)
+	}
+	defer syscall.Unlink(tempFile.Name())
+	defer tempFile.Close()
+	err = DumpReaderToFile(strings.NewReader(testString), tempFile.Name())
+	if err != nil {
+		t.Errorf("error in DumpReaderToFile: %v", err)
+	}
+	data, err := ioutil.ReadFile(tempFile.Name())
+	if err != nil {
+		t.Errorf("error when reading %s: %v", tempFile.Name(), err)
+	}
+	stringData := string(data)
+	if stringData != testString {
+		t.Fatalf("Wrong file content %s != %s", testString, stringData)
+	}
+}
+
+func TestMaybeConvert(t *testing.T) {
 	tests := []struct {
-		err      error
-		expected string
+		input    runtime.Object
+		gv       unversioned.GroupVersion
+		expected runtime.Object
 	}{
 		{
-			errors.NewInvalid("Invalid1", "invalidation", fielderrors.ValidationErrorList{fielderrors.NewFieldInvalid("Cause", "single", "details")}),
-			`Error from server: Invalid1 "invalidation" is invalid: Cause: invalid value 'single': details`,
+			input: &api.Pod{
+				ObjectMeta: api.ObjectMeta{
+					Name: "foo",
+				},
+			},
+			gv: unversioned.GroupVersion{Group: "", Version: "v1"},
+			expected: &v1.Pod{
+				TypeMeta: unversioned.TypeMeta{
+					APIVersion: "v1",
+					Kind:       "Pod",
+				},
+				ObjectMeta: v1.ObjectMeta{
+					Name: "foo",
+				},
+			},
 		},
 		{
-			errors.NewInvalid("Invalid2", "invalidation", fielderrors.ValidationErrorList{fielderrors.NewFieldInvalid("Cause", "multi1", "details"), fielderrors.NewFieldInvalid("Cause", "multi2", "details")}),
-			`Error from server: Invalid2 "invalidation" is invalid: [Cause: invalid value 'multi1': details, Cause: invalid value 'multi2': details]`,
+			input: &extensions.ThirdPartyResourceData{
+				ObjectMeta: api.ObjectMeta{
+					Name: "foo",
+				},
+				Data: []byte("this is some data"),
+			},
+			expected: &extensions.ThirdPartyResourceData{
+				ObjectMeta: api.ObjectMeta{
+					Name: "foo",
+				},
+				Data: []byte("this is some data"),
+			},
 		},
-		{
-			errors.NewInvalid("Invalid3", "invalidation", fielderrors.ValidationErrorList{}),
-			`Error from server: Invalid3 "invalidation" is invalid: <nil>`,
-		},
-	}
-
-	var errReturned string
-	errHandle := func(err string) {
-		errReturned = err
 	}
 
 	for _, test := range tests {
-		checkErr(test.err, errHandle)
-
-		if errReturned != test.expected {
-			t.Fatalf("Got: %s, expected: %s", errReturned, test.expected)
+		obj, err := MaybeConvertObject(test.input, test.gv, testapi.Default.Converter())
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(test.expected, obj) {
+			t.Errorf("expected:\n%#v\nsaw:\n%#v\n", test.expected, obj)
 		}
 	}
 }

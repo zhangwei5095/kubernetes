@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,30 +20,27 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coreos/go-etcd/etcd"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/registrytest"
+	"k8s.io/kubernetes/pkg/registry/service/allocator"
+	"k8s.io/kubernetes/pkg/storage/etcd/etcdtest"
+	etcdtesting "k8s.io/kubernetes/pkg/storage/etcd/testing"
+	"k8s.io/kubernetes/pkg/storage/storagebackend"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/service/allocator"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools/etcdtest"
+	"golang.org/x/net/context"
 )
 
-func newHelper(t *testing.T) (*tools.FakeEtcdClient, tools.EtcdHelper) {
-	fakeEtcdClient := tools.NewFakeEtcdClient(t)
-	fakeEtcdClient.TestIndex = true
-	helper := tools.NewEtcdHelper(fakeEtcdClient, testapi.Codec(), etcdtest.PathPrefix())
-	return fakeEtcdClient, helper
+func newStorage(t *testing.T) (*Etcd, *etcdtesting.EtcdTestServer, allocator.Interface, *storagebackend.Config) {
+	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
+	mem := allocator.NewAllocationMap(100, "rangeSpecValue")
+	etcd := NewEtcd(mem, "/ranges/serviceips", api.Resource("serviceipallocations"), etcdStorage)
+	return etcd, server, mem, etcdStorage
 }
 
-func newStorage(t *testing.T) (*Etcd, allocator.Interface, *tools.FakeEtcdClient) {
-	fakeEtcdClient, h := newHelper(t)
-
-	mem := allocator.NewAllocationMap(100, "rangeSpecValue")
-	etcd := NewEtcd(mem, "/ranges/serviceips", "serviceipallocation", h)
-
-	return etcd, mem, fakeEtcdClient
+func validNewRangeAllocation() *api.RangeAllocation {
+	return &api.RangeAllocation{
+		Range: "rangeSpecValue",
+	}
 }
 
 func key() string {
@@ -52,31 +49,19 @@ func key() string {
 }
 
 func TestEmpty(t *testing.T) {
-	storage, _, ecli := newStorage(t)
-	ecli.ExpectNotFoundGet(key())
-	if _, err := storage.Allocate(1); !strings.Contains(err.Error(), "cannot allocate resources of type serviceipallocation at this time") {
+	storage, server, _, _ := newStorage(t)
+	defer server.Terminate(t)
+	if _, err := storage.Allocate(1); !strings.Contains(err.Error(), "cannot allocate resources of type serviceipallocations at this time") {
 		t.Fatal(err)
 	}
 }
 
-func initialObject(ecli *tools.FakeEtcdClient) {
-	ecli.Data[key()] = tools.EtcdResponseWithError{
-		R: &etcd.Response{
-			Node: &etcd.Node{
-				CreatedIndex:  1,
-				ModifiedIndex: 2,
-				Value: runtime.EncodeOrDie(testapi.Codec(), &api.RangeAllocation{
-					Range: "rangeSpecValue",
-				}),
-			},
-		},
-		E: nil,
-	}
-}
-
 func TestStore(t *testing.T) {
-	storage, backing, ecli := newStorage(t)
-	initialObject(ecli)
+	storage, server, backing, config := newStorage(t)
+	defer server.Terminate(t)
+	if err := storage.storage.Create(context.TODO(), key(), validNewRangeAllocation(), nil, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if _, err := storage.Allocate(2); err != nil {
 		t.Fatal(err)
@@ -92,20 +77,11 @@ func TestStore(t *testing.T) {
 		t.Fatal("Expected allocation to fail")
 	}
 
-	obj := ecli.Data[key()]
-	if obj.R == nil || obj.R.Node == nil {
-		t.Fatalf("%s is empty: %#v", key(), obj)
-	}
-	t.Logf("data: %#v", obj.R.Node)
-
 	other := allocator.NewAllocationMap(100, "rangeSpecValue")
 
 	allocation := &api.RangeAllocation{}
-	if err := storage.helper.ExtractObj(key(), allocation, false); err != nil {
+	if err := storage.storage.Get(context.TODO(), key(), allocation, false); err != nil {
 		t.Fatal(err)
-	}
-	if allocation.ResourceVersion != "1" {
-		t.Fatalf("%#v", allocation)
 	}
 	if allocation.Range != "rangeSpecValue" {
 		t.Errorf("unexpected stored Range: %s", allocation.Range)
@@ -118,7 +94,7 @@ func TestStore(t *testing.T) {
 	}
 
 	other = allocator.NewAllocationMap(100, "rangeSpecValue")
-	otherStorage := NewEtcd(other, "/ranges/serviceips", "serviceipallocation", storage.helper)
+	otherStorage := NewEtcd(other, "/ranges/serviceips", api.Resource("serviceipallocations"), config)
 	if ok, err := otherStorage.Allocate(2); ok || err != nil {
 		t.Fatal(err)
 	}

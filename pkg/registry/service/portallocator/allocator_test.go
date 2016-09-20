@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,13 +19,15 @@ package portallocator
 import (
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"strconv"
+
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/util/net"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 func TestAllocate(t *testing.T) {
-	pr, err := util.ParsePortRange("10000-10200")
+	pr, err := net.ParsePortRange("10000-10200")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,7 @@ func TestAllocate(t *testing.T) {
 	if f := r.Free(); f != 201 {
 		t.Errorf("unexpected free %d", f)
 	}
-	found := util.NewStringSet()
+	found := sets.NewString()
 	count := 0
 	for r.Free() > 0 {
 		p, err := r.AllocateNext()
@@ -42,10 +44,10 @@ func TestAllocate(t *testing.T) {
 		}
 		count++
 		if !pr.Contains(p) {
-			t.Fatalf("allocated %s which is outside of %s", p, pr)
+			t.Fatalf("allocated %d which is outside of %v", p, pr)
 		}
 		if found.Has(strconv.Itoa(p)) {
-			t.Fatalf("allocated %s twice @ %d", p, count)
+			t.Fatalf("allocated %d twice @ %d", p, count)
 		}
 		found.Insert(strconv.Itoa(p))
 	}
@@ -65,7 +67,7 @@ func TestAllocate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if released != p {
-		t.Errorf("unexpected %s : %s", p, released)
+		t.Errorf("unexpected %d : %d", p, released)
 	}
 
 	if err := r.Release(released); err != nil {
@@ -95,7 +97,7 @@ func TestAllocate(t *testing.T) {
 }
 
 func TestSnapshot(t *testing.T) {
-	pr, err := util.ParsePortRange("10000-10200")
+	pr, err := net.ParsePortRange("10000-10200")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +117,7 @@ func TestSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pr2, err := util.ParsePortRange(dst.Range)
+	pr2, err := net.ParsePortRange(dst.Range)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +126,7 @@ func TestSnapshot(t *testing.T) {
 		t.Fatalf("mismatched networks: %s : %s", pr, pr2)
 	}
 
-	otherPr, err := util.ParsePortRange("200-300")
+	otherPr, err := net.ParsePortRange("200-300")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +141,7 @@ func TestSnapshot(t *testing.T) {
 
 	for _, n := range ports {
 		if !other.Has(n) {
-			t.Errorf("restored range does not have %s", n)
+			t.Errorf("restored range does not have %d", n)
 		}
 	}
 	if other.Free() != r.Free() {

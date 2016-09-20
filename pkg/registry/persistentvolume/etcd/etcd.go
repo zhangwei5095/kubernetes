@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,49 +17,60 @@ limitations under the License.
 package etcd
 
 import (
-	"path"
-
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	etcdgeneric "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/persistentvolume"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/rest"
+	"k8s.io/kubernetes/pkg/registry/cachesize"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
+	"k8s.io/kubernetes/pkg/registry/persistentvolume"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/storage"
 )
 
-// rest implements a RESTStorage for persistentvolumes against etcd
 type REST struct {
-	*etcdgeneric.Etcd
+	*registry.Store
 }
 
-// NewREST returns a RESTStorage object that will work against PersistentVolume objects.
-func NewStorage(h tools.EtcdHelper) (*REST, *StatusREST) {
-	prefix := "/persistentvolumes"
-	store := &etcdgeneric.Etcd{
+// NewREST returns a RESTStorage object that will work against persistent volumes.
+func NewREST(opts generic.RESTOptions) (*REST, *StatusREST) {
+	prefix := "/" + opts.ResourcePrefix
+
+	newListFunc := func() runtime.Object { return &api.PersistentVolumeList{} }
+	storageInterface, dFunc := opts.Decorator(
+		opts.StorageConfig,
+		cachesize.GetWatchCacheSizeByResource(cachesize.PersistentVolumes),
+		&api.PersistentVolume{},
+		prefix,
+		persistentvolume.Strategy,
+		newListFunc,
+		storage.NoTriggerPublisher,
+	)
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.PersistentVolume{} },
-		NewListFunc: func() runtime.Object { return &api.PersistentVolumeList{} },
+		NewListFunc: newListFunc,
 		KeyRootFunc: func(ctx api.Context) string {
 			return prefix
 		},
 		KeyFunc: func(ctx api.Context, name string) (string, error) {
-			return path.Join(prefix, name), nil
+			return registry.NoNamespaceKeyFunc(ctx, prefix, name)
 		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.PersistentVolume).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return persistentvolume.MatchPersistentVolumes(label, field)
-		},
-		EndpointName: "persistentvolume",
+		PredicateFunc:           persistentvolume.MatchPersistentVolumes,
+		QualifiedResource:       api.Resource("persistentvolumes"),
+		EnableGarbageCollection: opts.EnableGarbageCollection,
+		DeleteCollectionWorkers: opts.DeleteCollectionWorkers,
 
-		Helper: h,
+		CreateStrategy:      persistentvolume.Strategy,
+		UpdateStrategy:      persistentvolume.Strategy,
+		DeleteStrategy:      persistentvolume.Strategy,
+		ReturnDeletedObject: true,
+
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
-
-	store.CreateStrategy = persistentvolume.Strategy
-	store.UpdateStrategy = persistentvolume.Strategy
-	store.ReturnDeletedObject = true
 
 	statusStore := *store
 	statusStore.UpdateStrategy = persistentvolume.StatusStrategy
@@ -69,14 +80,19 @@ func NewStorage(h tools.EtcdHelper) (*REST, *StatusREST) {
 
 // StatusREST implements the REST endpoint for changing the status of a persistentvolume.
 type StatusREST struct {
-	store *etcdgeneric.Etcd
+	store *registry.Store
 }
 
 func (r *StatusREST) New() runtime.Object {
 	return &api.PersistentVolume{}
 }
 
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *StatusREST) Get(ctx api.Context, name string) (runtime.Object, error) {
+	return r.store.Get(ctx, name)
+}
+
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx api.Context, obj runtime.Object) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, obj)
+func (r *StatusREST) Update(ctx api.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+	return r.store.Update(ctx, name, objInfo)
 }

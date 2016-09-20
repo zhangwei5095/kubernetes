@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 // ThreadSafeStore is an interface that allows concurrent access to a storage backend.
@@ -41,8 +41,16 @@ type ThreadSafeStore interface {
 	Get(key string) (item interface{}, exists bool)
 	List() []interface{}
 	ListKeys() []string
-	Replace(map[string]interface{})
+	Replace(map[string]interface{}, string)
 	Index(indexName string, obj interface{}) ([]interface{}, error)
+	ListIndexFuncValues(name string) []string
+	ByIndex(indexName, indexKey string) ([]interface{}, error)
+	GetIndexers() Indexers
+
+	// AddIndexers adds more indexers to this store.  If you call this after you already have data
+	// in the store, the results are undefined.
+	AddIndexers(newIndexers Indexers) error
+	Resync() error
 }
 
 // threadSafeMap implements ThreadSafeStore
@@ -110,7 +118,7 @@ func (c *threadSafeMap) ListKeys() []string {
 	return list
 }
 
-func (c *threadSafeMap) Replace(items map[string]interface{}) {
+func (c *threadSafeMap) Replace(items map[string]interface{}, resourceVersion string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.items = items
@@ -133,17 +141,84 @@ func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{},
 		return nil, fmt.Errorf("Index with name %s does not exist", indexName)
 	}
 
-	indexKey, err := indexFunc(obj)
+	indexKeys, err := indexFunc(obj)
 	if err != nil {
 		return nil, err
 	}
 	index := c.indices[indexName]
+
+	// need to de-dupe the return list.  Since multiple keys are allowed, this can happen.
+	returnKeySet := sets.String{}
+	for _, indexKey := range indexKeys {
+		set := index[indexKey]
+		for _, key := range set.UnsortedList() {
+			returnKeySet.Insert(key)
+		}
+	}
+
+	list := make([]interface{}, 0, returnKeySet.Len())
+	for absoluteKey := range returnKeySet {
+		list = append(list, c.items[absoluteKey])
+	}
+	return list, nil
+}
+
+// ByIndex returns a list of items that match an exact value on the index function
+func (c *threadSafeMap) ByIndex(indexName, indexKey string) ([]interface{}, error) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	indexFunc := c.indexers[indexName]
+	if indexFunc == nil {
+		return nil, fmt.Errorf("Index with name %s does not exist", indexName)
+	}
+
+	index := c.indices[indexName]
+
 	set := index[indexKey]
 	list := make([]interface{}, 0, set.Len())
 	for _, key := range set.List() {
 		list = append(list, c.items[key])
 	}
+
 	return list, nil
+}
+
+func (c *threadSafeMap) ListIndexFuncValues(indexName string) []string {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	index := c.indices[indexName]
+	names := make([]string, 0, len(index))
+	for key := range index {
+		names = append(names, key)
+	}
+	return names
+}
+
+func (c *threadSafeMap) GetIndexers() Indexers {
+	return c.indexers
+}
+
+func (c *threadSafeMap) AddIndexers(newIndexers Indexers) error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if len(c.items) > 0 {
+		return fmt.Errorf("cannot add indexers to running index")
+	}
+
+	oldKeys := sets.StringKeySet(c.indexers)
+	newKeys := sets.StringKeySet(newIndexers)
+
+	if oldKeys.HasAny(newKeys.List()...) {
+		return fmt.Errorf("indexer conflict: %v", oldKeys.Intersection(newKeys))
+	}
+
+	for k, v := range newIndexers {
+		c.indexers[k] = v
+	}
+	return nil
 }
 
 // updateIndices modifies the objects location in the managed indexes, if this is an update, you must provide an oldObj
@@ -154,7 +229,7 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 		c.deleteFromIndices(oldObj, key)
 	}
 	for name, indexFunc := range c.indexers {
-		indexValue, err := indexFunc(newObj)
+		indexValues, err := indexFunc(newObj)
 		if err != nil {
 			return err
 		}
@@ -163,12 +238,15 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 			index = Index{}
 			c.indices[name] = index
 		}
-		set := index[indexValue]
-		if set == nil {
-			set = util.StringSet{}
-			index[indexValue] = set
+
+		for _, indexValue := range indexValues {
+			set := index[indexValue]
+			if set == nil {
+				set = sets.String{}
+				index[indexValue] = set
+			}
+			set.Insert(key)
 		}
-		set.Insert(key)
 	}
 	return nil
 }
@@ -177,12 +255,16 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 // it is intended to be called from a function that already has a lock on the cache
 func (c *threadSafeMap) deleteFromIndices(obj interface{}, key string) error {
 	for name, indexFunc := range c.indexers {
-		indexValue, err := indexFunc(obj)
+		indexValues, err := indexFunc(obj)
 		if err != nil {
 			return err
 		}
+
 		index := c.indices[name]
-		if index != nil {
+		if index == nil {
+			continue
+		}
+		for _, indexValue := range indexValues {
 			set := index[indexValue]
 			if set != nil {
 				set.Delete(key)
@@ -192,10 +274,15 @@ func (c *threadSafeMap) deleteFromIndices(obj interface{}, key string) error {
 	return nil
 }
 
+func (c *threadSafeMap) Resync() error {
+	// Nothing to do
+	return nil
+}
+
 func NewThreadSafeStore(indexers Indexers, indices Indices) ThreadSafeStore {
 	return &threadSafeMap{
 		items:    map[string]interface{}{},
 		indexers: indexers,
-		indices:  Indices{},
+		indices:  indices,
 	}
 }

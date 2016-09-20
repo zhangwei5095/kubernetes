@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,31 +18,26 @@ limitations under the License.
 package kubectl
 
 import (
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/meta"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/kubernetes/pkg/api/unversioned"
 )
 
-const kubectlAnnotationPrefix = "kubectl.kubernetes.io/"
+const (
+	kubectlAnnotationPrefix = "kubectl.kubernetes.io/"
+)
 
 type NamespaceInfo struct {
 	Namespace string
 }
 
-// TODO Move to labels package.
-func formatLabels(labelMap map[string]string) string {
-	l := labels.Set(labelMap).String()
-	if l == "" {
-		l = "<none>"
-	}
-	return l
-}
-
 func listOfImages(spec *api.PodSpec) []string {
-	var images []string
+	images := make([]string, 0, len(spec.Containers))
 	for _, container := range spec.Containers {
 		images = append(images, container.Image)
 	}
@@ -53,71 +48,160 @@ func makeImageList(spec *api.PodSpec) string {
 	return strings.Join(listOfImages(spec), ",")
 }
 
+func NewThirdPartyResourceMapper(gvs []unversioned.GroupVersion, gvks []unversioned.GroupVersionKind) (meta.RESTMapper, error) {
+	mapper := meta.NewDefaultRESTMapper(gvs, func(gv unversioned.GroupVersion) (*meta.VersionInterfaces, error) {
+		for ix := range gvs {
+			if gvs[ix].Group == gv.Group && gvs[ix].Version == gv.Version {
+				return &meta.VersionInterfaces{
+					ObjectConvertor:  api.Scheme,
+					MetadataAccessor: meta.NewAccessor(),
+				}, nil
+			}
+		}
+		groupVersions := make([]string, 0, len(gvs))
+		for ix := range gvs {
+			groupVersions = append(groupVersions, gvs[ix].String())
+		}
+		return nil, fmt.Errorf("unsupported storage version: %s (valid: %s)", gv.String(), strings.Join(groupVersions, ", "))
+	})
+	for ix := range gvks {
+		mapper.Add(gvks[ix], meta.RESTScopeNamespace)
+	}
+	return mapper, nil
+}
+
 // OutputVersionMapper is a RESTMapper that will prefer mappings that
 // correspond to a preferred output version (if feasible)
 type OutputVersionMapper struct {
 	meta.RESTMapper
-	OutputVersion string
+
+	// output versions takes a list of preferred GroupVersions. Only the first
+	// hit for a given group will have effect.  This allows different output versions
+	// depending upon the group of the kind being requested
+	OutputVersions []unversioned.GroupVersion
 }
 
 // RESTMapping implements meta.RESTMapper by prepending the output version to the preferred version list.
-func (m OutputVersionMapper) RESTMapping(kind string, versions ...string) (*meta.RESTMapping, error) {
-	preferred := []string{m.OutputVersion}
-	for _, version := range versions {
-		if len(version) > 0 {
-			preferred = append(preferred, version)
+func (m OutputVersionMapper) RESTMapping(gk unversioned.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	for _, preferredVersion := range m.OutputVersions {
+		if gk.Group == preferredVersion.Group {
+			mapping, err := m.RESTMapper.RESTMapping(gk, preferredVersion.Version)
+			if err == nil {
+				return mapping, nil
+			}
+
+			break
 		}
 	}
-	// if the caller wants to use the default version list, try with the preferred version, and on
-	// error, use the default behavior.
-	if len(preferred) == 1 {
-		if m, err := m.RESTMapper.RESTMapping(kind, preferred...); err == nil {
-			return m, nil
+
+	return m.RESTMapper.RESTMapping(gk, versions...)
+}
+
+// ShortForms is the list of short names to their expanded names
+var ShortForms = map[string]string{
+	// Please keep this alphabetized
+	// If you add an entry here, please also take a look at pkg/kubectl/cmd/cmd.go
+	// and add an entry to valid_resources when appropriate.
+	"cm":     "configmaps",
+	"cs":     "componentstatuses",
+	"csr":    "certificatesigningrequests",
+	"deploy": "deployments",
+	"ds":     "daemonsets",
+	"ep":     "endpoints",
+	"ev":     "events",
+	"hpa":    "horizontalpodautoscalers",
+	"ing":    "ingresses",
+	"limits": "limitranges",
+	"no":     "nodes",
+	"ns":     "namespaces",
+	"po":     "pods",
+	"psp":    "podSecurityPolicies",
+	"pvc":    "persistentvolumeclaims",
+	"pv":     "persistentvolumes",
+	"quota":  "resourcequotas",
+	"rc":     "replicationcontrollers",
+	"rs":     "replicasets",
+	"sa":     "serviceaccounts",
+	"svc":    "services",
+}
+
+// ResourceShortFormFor looks up for a short form of resource names.
+func ResourceShortFormFor(resource string) (string, bool) {
+	var alias string
+	exists := false
+	for k, val := range ShortForms {
+		if val == resource {
+			alias = k
+			exists = true
+			break
 		}
-		preferred = nil
 	}
-	return m.RESTMapper.RESTMapping(kind, preferred...)
+	return alias, exists
 }
 
-// ShortcutExpander is a RESTMapper that can be used for Kubernetes
-// resources.
-type ShortcutExpander struct {
-	meta.RESTMapper
+// ResourceAliases returns the resource shortcuts and plural forms for the given resources.
+func ResourceAliases(rs []string) []string {
+	as := make([]string, 0, len(rs))
+	plurals := make(map[string]struct{}, len(rs))
+	for _, r := range rs {
+		var plural string
+		switch {
+		case r == "endpoints":
+			plural = r // exception. "endpoint" does not exist. Why?
+		case strings.HasSuffix(r, "y"):
+			plural = r[0:len(r)-1] + "ies"
+		case strings.HasSuffix(r, "s"):
+			plural = r + "es"
+		default:
+			plural = r + "s"
+		}
+		as = append(as, plural)
+
+		plurals[plural] = struct{}{}
+	}
+
+	for sf, r := range ShortForms {
+		if _, found := plurals[r]; found {
+			as = append(as, sf)
+		}
+	}
+	return as
 }
 
-// VersionAndKindForResource implements meta.RESTMapper. It expands the resource first, then invokes the wrapped
-// mapper.
-func (e ShortcutExpander) VersionAndKindForResource(resource string) (defaultVersion, kind string, err error) {
-	resource = expandResourceShortcut(resource)
-	defaultVersion, kind, err = e.RESTMapper.VersionAndKindForResource(resource)
-	// TODO: remove this once v1beta1 and v1beta2 are deprecated
-	if err == nil && kind == "Minion" {
-		err = fmt.Errorf("Alias minion(s) is deprecated. Use node(s) instead")
+// parseFileSource parses the source given. Acceptable formats include:
+//
+// 1.  source-path: the basename will become the key name
+// 2.  source-name=source-path: the source-name will become the key name and source-path is the path to the key file
+//
+// Key names cannot include '='.
+func parseFileSource(source string) (keyName, filePath string, err error) {
+	numSeparators := strings.Count(source, "=")
+	switch {
+	case numSeparators == 0:
+		return path.Base(source), source, nil
+	case numSeparators == 1 && strings.HasPrefix(source, "="):
+		return "", "", fmt.Errorf("key name for file path %v missing.", strings.TrimPrefix(source, "="))
+	case numSeparators == 1 && strings.HasSuffix(source, "="):
+		return "", "", fmt.Errorf("file path for key name %v missing.", strings.TrimSuffix(source, "="))
+	case numSeparators > 1:
+		return "", "", errors.New("Key names or file paths cannot contain '='.")
+	default:
+		components := strings.Split(source, "=")
+		return components[0], components[1], nil
 	}
-	return defaultVersion, kind, err
 }
 
-// expandResourceShortcut will return the expanded version of resource
-// (something that a pkg/api/meta.RESTMapper can understand), if it is
-// indeed a shortcut. Otherwise, will return resource unmodified.
-func expandResourceShortcut(resource string) string {
-	shortForms := map[string]string{
-		// Please keep this alphabetized
-		"cs":     "componentstatuses",
-		"ev":     "events",
-		"limits": "limitRanges",
-		"no":     "nodes",
-		"po":     "pods",
-		"pv":     "persistentVolumes",
-		"pvc":    "persistentVolumeClaims",
-		"quota":  "resourceQuotas",
-		"rc":     "replicationcontrollers",
-		// DEPRECATED: will be removed before 1.0
-		"se":  "services",
-		"svc": "services",
+// parseLiteralSource parses the source key=val pair
+func parseLiteralSource(source string) (keyName, value string, err error) {
+	// leading equal is invalid
+	if strings.Index(source, "=") == 0 {
+		return "", "", fmt.Errorf("invalid literal source %v, expected key=value", source)
 	}
-	if expanded, ok := shortForms[resource]; ok {
-		return expanded
+	// split after the first equal (so values can have the = character)
+	items := strings.SplitN(source, "=", 2)
+	if len(items) != 2 {
+		return "", "", fmt.Errorf("invalid literal source %v, expected key=value", source)
 	}
-	return resource
+
+	return items[0], items[1], nil
 }

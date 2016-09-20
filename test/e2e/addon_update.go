@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,9 +24,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"golang.org/x/crypto/ssh"
+	"k8s.io/kubernetes/pkg/api"
+	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/test/e2e/framework"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -57,7 +58,7 @@ spec:
         kubernetes.io/cluster-service: "true"
     spec:
       containers:
-      - image: gcr.io/google_containers/serve_hostname:1.1
+      - image: gcr.io/google_containers/serve_hostname:v1.4
         name: addon-test
         ports:
         - containerPort: 9376
@@ -87,7 +88,7 @@ spec:
         kubernetes.io/cluster-service: "true"
     spec:
       containers:
-      - image: gcr.io/google_containers/serve_hostname:1.1
+      - image: gcr.io/google_containers/serve_hostname:v1.4
         name: addon-test
         ports:
         - containerPort: 9376
@@ -155,7 +156,7 @@ spec:
         kubernetes.io/cluster-service: "true"
     spec:
       containers:
-      - image: gcr.io/google_containers/serve_hostname:1.1
+      - image: gcr.io/google_containers/serve_hostname:v1.4
         name: invalid-addon-test
         ports:
         - containerPort: 9376
@@ -188,63 +189,44 @@ type stringPair struct {
 	data, fileName string
 }
 
-var _ = Describe("Addon update", func() {
+var _ = framework.KubeDescribe("Addon update", func() {
 
 	var dir string
 	var sshClient *ssh.Client
-	var c *client.Client
-	var namespace *api.Namespace
+	f := framework.NewDefaultFramework("addon-update-test")
 
 	BeforeEach(func() {
-		// This test requires SSH, so the provider check should be identical to
-		// those tests.
-		if !providerIs("gce") {
+		// This test requires:
+		// - SSH master access
+		// ... so the provider check should be identical to the intersection of
+		// providers that provide those capabilities.
+		if !framework.ProviderIs("gce") {
 			return
 		}
+
 		var err error
-		c, err = loadClient()
+		sshClient, err = getMasterSSHClient()
 		Expect(err).NotTo(HaveOccurred())
-
-		sshClient, err = getSSHClient()
-		Expect(err).NotTo(HaveOccurred())
-
-		namespace, err = createTestingNS("addon-update-test", c)
-		Expect(err).NotTo(HaveOccurred())
-
-		// Reduce the addon update intervals so that we have faster response
-		// to changes in the addon directory.
-		// do not use "service" command because it clears the environment variables
-		sshExecAndVerify(sshClient, "sudo TEST_ADDON_CHECK_INTERVAL_SEC=1 /etc/init.d/kube-addons restart")
 	})
 
 	AfterEach(func() {
-		// This test requires SSH, so the provider check should be identical to
-		// those tests.
-		if !providerIs("gce") {
-			return
-		}
 		if sshClient != nil {
-			// restart addon_update with the default options
-			sshExec(sshClient, "sudo /etc/init.d/kube-addons restart")
 			sshClient.Close()
 		}
-		if err := c.Namespaces().Delete(namespace.Name); err != nil {
-			Failf("Couldn't delete ns %q: %s", namespace, err)
-		}
-		// Paranoia-- prevent reuse!
-		namespace = nil
-		c = nil
 	})
 
 	// WARNING: the test is not parallel-friendly!
-	It("should propagate add-on file changes", func() {
-		// This test requires SSH, so the provider check should be identical to
-		// those tests.
-		SkipUnlessProviderIs("gce")
+	It("should propagate add-on file changes [Slow]", func() {
+		// This test requires:
+		// - SSH
+		// - master access
+		// ... so the provider check should be identical to the intersection of
+		// providers that provide those capabilities.
+		framework.SkipUnlessProviderIs("gce")
 
 		//these tests are long, so I squeezed several cases in one scenario
 		Expect(sshClient).NotTo(BeNil())
-		dir = namespace.Name // we use it only to give a unique string for each test execution
+		dir = f.Namespace.Name // we use it only to give a unique string for each test execution
 
 		temporaryRemotePathPrefix := "addon-test-dir"
 		temporaryRemotePath := temporaryRemotePathPrefix + "/" + dir                  // in home directory on kubernetes-master
@@ -261,10 +243,10 @@ var _ = Describe("Addon update", func() {
 
 		var remoteFiles []stringPair = []stringPair{
 			{fmt.Sprintf(addon_controller_v1, defaultNsName), rcv1},
-			{fmt.Sprintf(addon_controller_v2, namespace.Name), rcv2},
-			{fmt.Sprintf(addon_service_v1, namespace.Name), svcv1},
-			{fmt.Sprintf(addon_service_v2, namespace.Name), svcv2},
-			{fmt.Sprintf(invalid_addon_controller_v1, namespace.Name), rcInvalid},
+			{fmt.Sprintf(addon_controller_v2, f.Namespace.Name), rcv2},
+			{fmt.Sprintf(addon_service_v1, f.Namespace.Name), svcv1},
+			{fmt.Sprintf(addon_service_v2, f.Namespace.Name), svcv2},
+			{fmt.Sprintf(invalid_addon_controller_v1, f.Namespace.Name), rcInvalid},
 			{fmt.Sprintf(invalid_addon_service_v1, defaultNsName), svcInvalid},
 		}
 
@@ -293,8 +275,8 @@ var _ = Describe("Addon update", func() {
 		sshExecAndVerify(sshClient, fmt.Sprintf("sudo cp %s/%s %s/%s", temporaryRemotePath, rcv1, destinationDir, rcv1))
 		sshExecAndVerify(sshClient, fmt.Sprintf("sudo cp %s/%s %s/%s", temporaryRemotePath, svcv1, destinationDir, svcv1))
 
-		waitForServiceInAddonTest(c, namespace.Name, "addon-test", true)
-		waitForReplicationControllerInAddonTest(c, defaultNsName, "addon-test-v1", true)
+		waitForServiceInAddonTest(f.Client, f.Namespace.Name, "addon-test", true)
+		waitForReplicationControllerInAddonTest(f.Client, defaultNsName, "addon-test-v1", true)
 
 		By("update manifests")
 		sshExecAndVerify(sshClient, fmt.Sprintf("sudo cp %s/%s %s/%s", temporaryRemotePath, rcv2, destinationDir, rcv2))
@@ -307,27 +289,27 @@ var _ = Describe("Addon update", func() {
 		 * But it is ok - as long as we don't have rolling update, the result will be the same
 		 */
 
-		waitForServiceInAddonTest(c, namespace.Name, "addon-test-updated", true)
-		waitForReplicationControllerInAddonTest(c, namespace.Name, "addon-test-v2", true)
+		waitForServiceInAddonTest(f.Client, f.Namespace.Name, "addon-test-updated", true)
+		waitForReplicationControllerInAddonTest(f.Client, f.Namespace.Name, "addon-test-v2", true)
 
-		waitForServiceInAddonTest(c, namespace.Name, "addon-test", false)
-		waitForReplicationControllerInAddonTest(c, defaultNsName, "addon-test-v1", false)
+		waitForServiceInAddonTest(f.Client, f.Namespace.Name, "addon-test", false)
+		waitForReplicationControllerInAddonTest(f.Client, defaultNsName, "addon-test-v1", false)
 
 		By("remove manifests")
 		sshExecAndVerify(sshClient, fmt.Sprintf("sudo rm %s/%s", destinationDir, rcv2))
 		sshExecAndVerify(sshClient, fmt.Sprintf("sudo rm %s/%s", destinationDir, svcv2))
 
-		waitForServiceInAddonTest(c, namespace.Name, "addon-test-updated", false)
-		waitForReplicationControllerInAddonTest(c, namespace.Name, "addon-test-v2", false)
+		waitForServiceInAddonTest(f.Client, f.Namespace.Name, "addon-test-updated", false)
+		waitForReplicationControllerInAddonTest(f.Client, f.Namespace.Name, "addon-test-v2", false)
 
 		By("verify invalid API addons weren't created")
-		_, err = c.ReplicationControllers(namespace.Name).Get("invalid-addon-test-v1")
+		_, err = f.Client.ReplicationControllers(f.Namespace.Name).Get("invalid-addon-test-v1")
 		Expect(err).To(HaveOccurred())
-		_, err = c.ReplicationControllers(defaultNsName).Get("invalid-addon-test-v1")
+		_, err = f.Client.ReplicationControllers(defaultNsName).Get("invalid-addon-test-v1")
 		Expect(err).To(HaveOccurred())
-		_, err = c.Services(namespace.Name).Get("ivalid-addon-test")
+		_, err = f.Client.Services(f.Namespace.Name).Get("ivalid-addon-test")
 		Expect(err).To(HaveOccurred())
-		_, err = c.Services(defaultNsName).Get("ivalid-addon-test")
+		_, err = f.Client.Services(defaultNsName).Get("ivalid-addon-test")
 		Expect(err).To(HaveOccurred())
 
 		// invalid addons will be deleted by the deferred function
@@ -335,28 +317,32 @@ var _ = Describe("Addon update", func() {
 })
 
 func waitForServiceInAddonTest(c *client.Client, addonNamespace, name string, exist bool) {
-	expectNoError(waitForService(c, addonNamespace, name, exist, addonTestPollInterval, addonTestPollTimeout))
+	framework.ExpectNoError(framework.WaitForService(c, addonNamespace, name, exist, addonTestPollInterval, addonTestPollTimeout))
 }
 
 func waitForReplicationControllerInAddonTest(c *client.Client, addonNamespace, name string, exist bool) {
-	expectNoError(waitForReplicationController(c, addonNamespace, name, exist, addonTestPollInterval, addonTestPollTimeout))
+	framework.ExpectNoError(framework.WaitForReplicationController(c, addonNamespace, name, exist, addonTestPollInterval, addonTestPollTimeout))
 }
 
-// TODO marekbiskup 2015-06-11: merge the ssh code into pkg/util/ssh.go after
-// kubernetes v1.0 is released. In particular the code of sshExec.
-func getSSHClient() (*ssh.Client, error) {
+// TODO use the framework.SSH code, either adding an SCP to it or copying files
+// differently.
+func getMasterSSHClient() (*ssh.Client, error) {
 	// Get a signer for the provider.
-	signer, err := getSigner(testContext.Provider)
+	signer, err := framework.GetSigner(framework.TestContext.Provider)
 	if err != nil {
-		return nil, fmt.Errorf("error getting signer for provider %s: '%v'", testContext.Provider, err)
+		return nil, fmt.Errorf("error getting signer for provider %s: '%v'", framework.TestContext.Provider, err)
 	}
 
+	sshUser := os.Getenv("KUBE_SSH_USER")
+	if sshUser == "" {
+		sshUser = os.Getenv("USER")
+	}
 	config := &ssh.ClientConfig{
-		User: os.Getenv("USER"),
+		User: sshUser,
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
 	}
 
-	host := getMasterHost() + ":22"
+	host := framework.GetMasterHost() + ":22"
 	client, err := ssh.Dial("tcp", host, config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting SSH client to host %s: '%v'", host, err)
@@ -371,7 +357,7 @@ func sshExecAndVerify(client *ssh.Client, cmd string) {
 }
 
 func sshExec(client *ssh.Client, cmd string) (string, string, int, error) {
-	Logf(fmt.Sprintf("Executing '%s' on %v", cmd, client.RemoteAddr()))
+	framework.Logf("Executing '%s' on %v", cmd, client.RemoteAddr())
 	session, err := client.NewSession()
 	if err != nil {
 		return "", "", 0, fmt.Errorf("error creating session to host %s: '%v'", client.RemoteAddr(), err)
@@ -403,7 +389,7 @@ func sshExec(client *ssh.Client, cmd string) (string, string, int, error) {
 }
 
 func writeRemoteFile(sshClient *ssh.Client, data, dir, fileName string, mode os.FileMode) error {
-	Logf(fmt.Sprintf("Writing remote file '%s/%s' on %v", dir, fileName, sshClient.RemoteAddr()))
+	framework.Logf(fmt.Sprintf("Writing remote file '%s/%s' on %v", dir, fileName, sshClient.RemoteAddr()))
 	session, err := sshClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("error creating session to host %s: '%v'", sshClient.RemoteAddr(), err)
@@ -411,16 +397,17 @@ func writeRemoteFile(sshClient *ssh.Client, data, dir, fileName string, mode os.
 	defer session.Close()
 
 	fileSize := len(data)
-	go func() {
-		// ignore errors here. scp whould return errors if something goes wrong.
-		pipe, _ := session.StdinPipe()
-		defer pipe.Close()
-		fmt.Fprintf(pipe, "C%#o %d %s\n", mode, fileSize, fileName)
-		io.Copy(pipe, strings.NewReader(data))
-		fmt.Fprint(pipe, "\x00")
-	}()
-	if err := session.Run(fmt.Sprintf("scp -t %s", dir)); err != nil {
+	pipe, err := session.StdinPipe()
+	if err != nil {
 		return err
 	}
-	return nil
+	defer pipe.Close()
+	if err := session.Start(fmt.Sprintf("scp -t %s", dir)); err != nil {
+		return err
+	}
+	fmt.Fprintf(pipe, "C%#o %d %s\n", mode, fileSize, fileName)
+	io.Copy(pipe, strings.NewReader(data))
+	fmt.Fprint(pipe, "\x00")
+	pipe.Close()
+	return session.Wait()
 }

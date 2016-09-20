@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,8 @@ limitations under the License.
 package election
 
 import (
-	"sync"
-
-	"github.com/GoogleCloudPlatform/kubernetes/contrib/mesos/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	"k8s.io/kubernetes/contrib/mesos/pkg/runtime"
+	"k8s.io/kubernetes/pkg/watch"
 
 	"github.com/golang/glog"
 )
@@ -46,14 +44,7 @@ type Service interface {
 }
 
 type notifier struct {
-	lock sync.Mutex
-	cond *sync.Cond
-
-	// desired is updated with every change, current is updated after
-	// Start()/Stop() finishes. 'cond' is used to signal that a change
-	// might be needed. This handles the case where mastership flops
-	// around without calling Start()/Stop() excessively.
-	desired, current Master
+	masters chan Master // elected masters arrive here, should be buffered to better deal with rapidly flapping masters
 
 	// for comparison, to see if we are master.
 	id Master
@@ -64,8 +55,7 @@ type notifier struct {
 // Notify runs Elect() on m, and calls Start()/Stop() on s when the
 // elected master starts/stops matching 'id'. Never returns.
 func Notify(m MasterElector, path, id string, s Service, abort <-chan struct{}) {
-	n := &notifier{id: Master(id), service: s}
-	n.cond = sync.NewCond(&n.lock)
+	n := &notifier{id: Master(id), service: s, masters: make(chan Master, 1)}
 	finished := runtime.After(func() {
 		runtime.Until(func() {
 			for {
@@ -86,14 +76,23 @@ func Notify(m MasterElector, path, id string, s Service, abort <-chan struct{}) 
 							glog.Errorf("Unexpected object from election channel: %v", event.Object)
 							break
 						}
-						func() {
-							n.lock.Lock()
-							defer n.lock.Unlock()
-							n.desired = electedMaster
-							if n.desired != n.current {
-								n.cond.Signal()
+
+					sendElected:
+						for {
+							select {
+							case <-abort:
+								return
+							case n.masters <- electedMaster:
+								break sendElected
+							default: // ring full, discard old value and add the new
+								select {
+								case <-abort:
+									return
+								case <-n.masters:
+								default: // ring was cleared for us?!
+								}
 							}
-						}()
+						}
 					}
 				}
 			}
@@ -104,31 +103,19 @@ func Notify(m MasterElector, path, id string, s Service, abort <-chan struct{}) 
 
 // serviceLoop waits for changes, and calls Start()/Stop() as needed.
 func (n *notifier) serviceLoop(abort <-chan struct{}) {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+	var current Master
 	for {
 		select {
 		case <-abort:
 			return
-		default:
-			for n.desired == n.current {
-				ch := runtime.After(n.cond.Wait)
-				select {
-				case <-abort:
-					n.cond.Signal() // ensure that Wait() returns
-					<-ch
-					return
-				case <-ch:
-					// we were notified and have the lock, proceed..
-				}
-			}
-			if n.current != n.id && n.desired == n.id {
-				n.service.Validate(n.desired, n.current)
+		case desired := <-n.masters:
+			if current != n.id && desired == n.id {
+				n.service.Validate(desired, current)
 				n.service.Start()
-			} else if n.current == n.id && n.desired != n.id {
+			} else if current == n.id && desired != n.id {
 				n.service.Stop()
 			}
-			n.current = n.desired
+			current = desired
 		}
 	}
 }

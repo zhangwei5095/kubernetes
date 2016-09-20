@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package volume
 import (
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api"
 )
 
 func TestSpecSourceConverters(t *testing.T) {
@@ -29,11 +29,11 @@ func TestSpecSourceConverters(t *testing.T) {
 	}
 
 	converted := NewSpecFromVolume(v)
-	if converted.VolumeSource.EmptyDir == nil {
-		t.Errorf("Unexpected nil EmptyDir: %+v", converted)
+	if converted.Volume.EmptyDir == nil {
+		t.Errorf("Unexpected nil EmptyDir: %#v", converted)
 	}
-	if v.Name != converted.Name {
-		t.Errorf("Expected %v but got %v", v.Name, converted.Name)
+	if v.Name != converted.Name() {
+		t.Errorf("Expected %v but got %v", v.Name, converted.Name())
 	}
 
 	pv := &api.PersistentVolume{
@@ -43,11 +43,11 @@ func TestSpecSourceConverters(t *testing.T) {
 		},
 	}
 
-	converted = NewSpecFromPersistentVolume(pv)
-	if converted.PersistentVolumeSource.AWSElasticBlockStore == nil {
-		t.Errorf("Unexpected nil AWSElasticBlockStore: %+v", converted)
+	converted = NewSpecFromPersistentVolume(pv, false)
+	if converted.PersistentVolume.Spec.AWSElasticBlockStore == nil {
+		t.Errorf("Unexpected nil AWSElasticBlockStore: %#v", converted)
 	}
-	if pv.Name != converted.Name {
-		t.Errorf("Expected %v but got %v", pv.Name, converted.Name)
+	if pv.Name != converted.Name() {
+		t.Errorf("Expected %v but got %v", pv.Name, converted.Name())
 	}
 }

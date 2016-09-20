@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,18 +22,31 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/util"
 )
 
 const (
 	DefaultHostAcceptRE   = "^localhost$,^127\\.0\\.0\\.1$,^\\[::1\\]$"
 	DefaultPathAcceptRE   = "^/.*"
-	DefaultPathRejectRE   = "^/api/.*/exec,^/api/.*/run"
+	DefaultPathRejectRE   = "^/api/.*/pods/.*/exec,^/api/.*/pods/.*/attach"
 	DefaultMethodRejectRE = "POST,PUT,PATCH"
+)
+
+var (
+	// The reverse proxy will periodically flush the io writer at this frequency.
+	// Only matters for long poll connections like the one used to watch. With an
+	// interval of 0 the reverse proxy will buffer content sent on any connection
+	// with transfer-encoding=chunked.
+	// TODO: Flush after each chunk so the client doesn't suffer a 100ms latency per
+	// watch event.
+	ReverseProxyFlushInterval = 100 * time.Millisecond
 )
 
 // FilterServer rejects requests which don't match one of the specified regular expressions
@@ -50,7 +63,7 @@ type FilterServer struct {
 	delegate http.Handler
 }
 
-// Splits a comma separated list of regexps into a array of Regexp objects.
+// Splits a comma separated list of regexps into an array of Regexp objects.
 func MakeRegexpArray(str string) ([]*regexp.Regexp, error) {
 	parts := strings.Split(str, ",")
 	result := make([]*regexp.Regexp, len(parts))
@@ -106,8 +119,17 @@ func (f *FilterServer) HandlerFor(delegate http.Handler) *FilterServer {
 	return &f2
 }
 
+// Get host from a host header value like "localhost" or "localhost:8080"
+func extractHost(header string) (host string) {
+	host, _, err := net.SplitHostPort(header)
+	if err != nil {
+		host = header
+	}
+	return host
+}
+
 func (f *FilterServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	host, _, _ := net.SplitHostPort(req.Host)
+	host := extractHost(req.Host)
 	if f.accept(req.Method, req.URL.Path, host) {
 		f.delegate.ServeHTTP(rw, req)
 		return
@@ -124,7 +146,7 @@ type ProxyServer struct {
 // NewProxyServer creates and installs a new ProxyServer.
 // It automatically registers the created ProxyServer to http.DefaultServeMux.
 // 'filter', if non-nil, protects requests to the api only.
-func NewProxyServer(filebase string, apiProxyPrefix string, staticPrefix string, filter *FilterServer, cfg *client.Config) (*ProxyServer, error) {
+func NewProxyServer(filebase string, apiProxyPrefix string, staticPrefix string, filter *FilterServer, cfg *restclient.Config) (*ProxyServer, error) {
 	host := cfg.Host
 	if !strings.HasSuffix(host, "/") {
 		host = host + "/"
@@ -134,7 +156,7 @@ func NewProxyServer(filebase string, apiProxyPrefix string, staticPrefix string,
 		return nil, err
 	}
 	proxy := newProxy(target)
-	if proxy.Transport, err = client.TransportFor(cfg); err != nil {
+	if proxy.Transport, err = restclient.TransportFor(cfg); err != nil {
 		return nil, err
 	}
 	proxyServer := http.Handler(proxy)
@@ -156,13 +178,31 @@ func NewProxyServer(filebase string, apiProxyPrefix string, staticPrefix string,
 	return &ProxyServer{handler: mux}, nil
 }
 
-// Serve starts the server (http.DefaultServeMux) on given port, loops forever.
-func (s *ProxyServer) Serve(port int) error {
+// Listen is a simple wrapper around net.Listen.
+func (s *ProxyServer) Listen(address string, port int) (net.Listener, error) {
+	return net.Listen("tcp", fmt.Sprintf("%s:%d", address, port))
+}
+
+// ListenUnix does net.Listen for a unix socket
+func (s *ProxyServer) ListenUnix(path string) (net.Listener, error) {
+	// Remove any socket, stale or not, but fall through for other files
+	fi, err := os.Stat(path)
+	if err == nil && (fi.Mode()&os.ModeSocket) != 0 {
+		os.Remove(path)
+	}
+	// Default to only user accessible socket, caller can open up later if desired
+	oldmask, _ := util.Umask(0077)
+	l, err := net.Listen("unix", path)
+	util.Umask(oldmask)
+	return l, err
+}
+
+// Serve starts the server using given listener, loops forever.
+func (s *ProxyServer) ServeOnListener(l net.Listener) error {
 	server := http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
 		Handler: s.handler,
 	}
-	return server.ListenAndServe()
+	return server.Serve(l)
 }
 
 func newProxy(target *url.URL) *httputil.ReverseProxy {
@@ -171,7 +211,7 @@ func newProxy(target *url.URL) *httputil.ReverseProxy {
 		req.URL.Host = target.Host
 		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
 	}
-	return &httputil.ReverseProxy{Director: director}
+	return &httputil.ReverseProxy{Director: director, FlushInterval: ReverseProxyFlushInterval}
 }
 
 func newFileHandler(prefix, base string) http.Handler {

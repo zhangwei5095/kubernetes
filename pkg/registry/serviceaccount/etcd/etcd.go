@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,48 +17,58 @@ limitations under the License.
 package etcd
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	etcdgeneric "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/serviceaccount"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/cachesize"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
+	"k8s.io/kubernetes/pkg/registry/serviceaccount"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/storage"
 )
 
-// REST implements a RESTStorage for service accounts against etcd
 type REST struct {
-	*etcdgeneric.Etcd
+	*registry.Store
 }
 
-const Prefix = "/serviceaccounts"
+// NewREST returns a RESTStorage object that will work against service accounts.
+func NewREST(opts generic.RESTOptions) *REST {
+	prefix := "/" + opts.ResourcePrefix
 
-// NewStorage returns a RESTStorage object that will work against service accounts objects.
-func NewStorage(h tools.EtcdHelper) *REST {
-	store := &etcdgeneric.Etcd{
+	newListFunc := func() runtime.Object { return &api.ServiceAccountList{} }
+	storageInterface, dFunc := opts.Decorator(
+		opts.StorageConfig,
+		cachesize.GetWatchCacheSizeByResource(cachesize.ServiceAccounts),
+		&api.ServiceAccount{},
+		prefix,
+		serviceaccount.Strategy,
+		newListFunc,
+		storage.NoTriggerPublisher,
+	)
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.ServiceAccount{} },
-		NewListFunc: func() runtime.Object { return &api.ServiceAccountList{} },
+		NewListFunc: newListFunc,
 		KeyRootFunc: func(ctx api.Context) string {
-			return etcdgeneric.NamespaceKeyRootFunc(ctx, Prefix)
+			return registry.NamespaceKeyRootFunc(ctx, prefix)
 		},
 		KeyFunc: func(ctx api.Context, name string) (string, error) {
-			return etcdgeneric.NamespaceKeyFunc(ctx, Prefix, name)
+			return registry.NamespaceKeyFunc(ctx, prefix, name)
 		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.ServiceAccount).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return serviceaccount.Matcher(label, field)
-		},
-		EndpointName: "serviceaccounts",
+		PredicateFunc:           serviceaccount.Matcher,
+		QualifiedResource:       api.Resource("serviceaccounts"),
+		EnableGarbageCollection: opts.EnableGarbageCollection,
+		DeleteCollectionWorkers: opts.DeleteCollectionWorkers,
 
-		Helper: h,
+		CreateStrategy:      serviceaccount.Strategy,
+		UpdateStrategy:      serviceaccount.Strategy,
+		DeleteStrategy:      serviceaccount.Strategy,
+		ReturnDeletedObject: true,
+
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
-
-	store.CreateStrategy = serviceaccount.Strategy
-	store.UpdateStrategy = serviceaccount.Strategy
-	store.ReturnDeletedObject = true
-
 	return &REST{store}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,26 +17,32 @@ limitations under the License.
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/watch"
 )
 
+var nevererrc chan error
+
 type testLW struct {
-	ListFunc  func() (runtime.Object, error)
-	WatchFunc func(resourceVersion string) (watch.Interface, error)
+	ListFunc  func(options api.ListOptions) (runtime.Object, error)
+	WatchFunc func(options api.ListOptions) (watch.Interface, error)
 }
 
-func (t *testLW) List() (runtime.Object, error) { return t.ListFunc() }
-func (t *testLW) Watch(resourceVersion string) (watch.Interface, error) {
-	return t.WatchFunc(resourceVersion)
+func (t *testLW) List(options api.ListOptions) (runtime.Object, error) {
+	return t.ListFunc(options)
+}
+func (t *testLW) Watch(options api.ListOptions) (watch.Interface, error) {
+	return t.WatchFunc(options)
 }
 
 func TestCloseWatchChannelOnError(t *testing.T) {
@@ -44,22 +50,22 @@ func TestCloseWatchChannelOnError(t *testing.T) {
 	pod := &api.Pod{ObjectMeta: api.ObjectMeta{Name: "bar"}}
 	fw := watch.NewFake()
 	r.listerWatcher = &testLW{
-		WatchFunc: func(rv string) (watch.Interface, error) {
+		WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
 			return fw, nil
 		},
-		ListFunc: func() (runtime.Object, error) {
-			return &api.PodList{ListMeta: api.ListMeta{ResourceVersion: "1"}}, nil
+		ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+			return &api.PodList{ListMeta: unversioned.ListMeta{ResourceVersion: "1"}}, nil
 		},
 	}
-	go r.listAndWatch(util.NeverStop)
+	go r.ListAndWatch(wait.NeverStop)
 	fw.Error(pod)
 	select {
 	case _, ok := <-fw.ResultChan():
 		if ok {
 			t.Errorf("Watch channel left open after cancellation")
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Errorf("the cancellation is at least 99 milliseconds late")
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Errorf("the cancellation is at least %s late", wait.ForeverTestTimeout.String())
 		break
 	}
 }
@@ -70,34 +76,34 @@ func TestRunUntil(t *testing.T) {
 	r := NewReflector(&testLW{}, &api.Pod{}, store, 0)
 	fw := watch.NewFake()
 	r.listerWatcher = &testLW{
-		WatchFunc: func(rv string) (watch.Interface, error) {
+		WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
 			return fw, nil
 		},
-		ListFunc: func() (runtime.Object, error) {
-			return &api.PodList{ListMeta: api.ListMeta{ResourceVersion: "1"}}, nil
+		ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+			return &api.PodList{ListMeta: unversioned.ListMeta{ResourceVersion: "1"}}, nil
 		},
 	}
 	r.RunUntil(stopCh)
 	// Synchronously add a dummy pod into the watch channel so we
 	// know the RunUntil go routine is in the watch handler.
 	fw.Add(&api.Pod{ObjectMeta: api.ObjectMeta{Name: "bar"}})
-	stopCh <- struct{}{}
+	close(stopCh)
 	select {
 	case _, ok := <-fw.ResultChan():
 		if ok {
 			t.Errorf("Watch channel left open after stopping the watch")
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Errorf("the cancellation is at least 99 milliseconds late")
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Errorf("the cancellation is at least %s late", wait.ForeverTestTimeout.String())
 		break
 	}
 }
 
-func TestReflector_resyncChan(t *testing.T) {
+func TestReflectorResyncChan(t *testing.T) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &api.Pod{}, s, time.Millisecond)
 	a, _ := g.resyncChan()
-	b := time.After(100 * time.Millisecond)
+	b := time.After(wait.ForeverTestTimeout)
 	select {
 	case <-a:
 		t.Logf("got timeout as expected")
@@ -106,7 +112,7 @@ func TestReflector_resyncChan(t *testing.T) {
 	}
 }
 
-func BenchmarkReflector_resyncChanMany(b *testing.B) {
+func BenchmarkReflectorResyncChanMany(b *testing.B) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &api.Pod{}, s, 25*time.Millisecond)
 	// The improvement to this (calling the timer's Stop() method) makes
@@ -118,7 +124,7 @@ func BenchmarkReflector_resyncChanMany(b *testing.B) {
 	}
 }
 
-func TestReflector_watchHandlerError(t *testing.T) {
+func TestReflectorWatchHandlerError(t *testing.T) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &api.Pod{}, s, 0)
 	fw := watch.NewFake()
@@ -126,13 +132,13 @@ func TestReflector_watchHandlerError(t *testing.T) {
 		fw.Stop()
 	}()
 	var resumeRV string
-	err := g.watchHandler(fw, &resumeRV, neverExitWatch, util.NeverStop)
+	err := g.watchHandler(fw, &resumeRV, nevererrc, wait.NeverStop)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
 }
 
-func TestReflector_watchHandler(t *testing.T) {
+func TestReflectorWatchHandler(t *testing.T) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &api.Pod{}, s, 0)
 	fw := watch.NewFake()
@@ -146,7 +152,7 @@ func TestReflector_watchHandler(t *testing.T) {
 		fw.Stop()
 	}()
 	var resumeRV string
-	err := g.watchHandler(fw, &resumeRV, neverExitWatch, util.NeverStop)
+	err := g.watchHandler(fw, &resumeRV, nevererrc, wait.NeverStop)
 	if err != nil {
 		t.Errorf("unexpected error %v", err)
 	}
@@ -188,19 +194,6 @@ func TestReflector_watchHandler(t *testing.T) {
 	}
 }
 
-func TestReflector_watchHandlerTimeout(t *testing.T) {
-	s := NewStore(MetaNamespaceKeyFunc)
-	g := NewReflector(&testLW{}, &api.Pod{}, s, 0)
-	fw := watch.NewFake()
-	var resumeRV string
-	exit := make(chan time.Time, 1)
-	exit <- time.Now()
-	err := g.watchHandler(fw, &resumeRV, exit, util.NeverStop)
-	if err != errorResyncRequested {
-		t.Errorf("expected timeout error, but got %q", err)
-	}
-}
-
 func TestReflectorStopWatch(t *testing.T) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &api.Pod{}, s, 0)
@@ -208,13 +201,13 @@ func TestReflectorStopWatch(t *testing.T) {
 	var resumeRV string
 	stopWatch := make(chan struct{}, 1)
 	stopWatch <- struct{}{}
-	err := g.watchHandler(fw, &resumeRV, neverExitWatch, stopWatch)
+	err := g.watchHandler(fw, &resumeRV, nevererrc, stopWatch)
 	if err != errorStopRequested {
 		t.Errorf("expected stop error, got %q", err)
 	}
 }
 
-func TestReflector_listAndWatch(t *testing.T) {
+func TestReflectorListAndWatch(t *testing.T) {
 	createdFakes := make(chan *watch.FakeWatcher)
 
 	// The ListFunc says that it's at revision 1. Therefore, we expect our WatchFunc
@@ -222,7 +215,8 @@ func TestReflector_listAndWatch(t *testing.T) {
 	// inject an error.
 	expectedRVs := []string{"1", "3"}
 	lw := &testLW{
-		WatchFunc: func(rv string) (watch.Interface, error) {
+		WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
+			rv := options.ResourceVersion
 			fw := watch.NewFake()
 			if e, a := expectedRVs[0], rv; e != a {
 				t.Errorf("Expected rv %v, but got %v", e, a)
@@ -233,13 +227,13 @@ func TestReflector_listAndWatch(t *testing.T) {
 			go func() { createdFakes <- fw }()
 			return fw, nil
 		},
-		ListFunc: func() (runtime.Object, error) {
-			return &api.PodList{ListMeta: api.ListMeta{ResourceVersion: "1"}}, nil
+		ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+			return &api.PodList{ListMeta: unversioned.ListMeta{ResourceVersion: "1"}}, nil
 		},
 	}
 	s := NewFIFO(MetaNamespaceKeyFunc)
 	r := NewReflector(lw, &api.Pod{}, s, 0)
-	go r.listAndWatch(util.NeverStop)
+	go r.ListAndWatch(wait.NeverStop)
 
 	ids := []string{"foo", "bar", "baz", "qux", "zoo"}
 	var fw *watch.FakeWatcher
@@ -258,7 +252,7 @@ func TestReflector_listAndWatch(t *testing.T) {
 
 	// Verify we received the right ids with the right resource versions.
 	for i, id := range ids {
-		pod := s.Pop().(*api.Pod)
+		pod := Pop(s).(*api.Pod)
 		if e, a := id, pod.Name; e != a {
 			t.Errorf("%v: Expected %v, got %v", i, e, a)
 		}
@@ -272,12 +266,12 @@ func TestReflector_listAndWatch(t *testing.T) {
 	}
 }
 
-func TestReflector_listAndWatchWithErrors(t *testing.T) {
+func TestReflectorListAndWatchWithErrors(t *testing.T) {
 	mkPod := func(id string, rv string) *api.Pod {
 		return &api.Pod{ObjectMeta: api.ObjectMeta{Name: id, ResourceVersion: rv}}
 	}
 	mkList := func(rv string, pods ...*api.Pod) *api.PodList {
-		list := &api.PodList{ListMeta: api.ListMeta{ResourceVersion: rv}}
+		list := &api.PodList{ListMeta: unversioned.ListMeta{ResourceVersion: rv}}
 		for _, pod := range pods {
 			list.Items = append(list.Items, *pod)
 		}
@@ -292,14 +286,14 @@ func TestReflector_listAndWatchWithErrors(t *testing.T) {
 		{
 			list: mkList("1"),
 			events: []watch.Event{
-				{watch.Added, mkPod("foo", "2")},
-				{watch.Added, mkPod("bar", "3")},
+				{Type: watch.Added, Object: mkPod("foo", "2")},
+				{Type: watch.Added, Object: mkPod("bar", "3")},
 			},
 		}, {
 			list: mkList("3", mkPod("foo", "2"), mkPod("bar", "3")),
 			events: []watch.Event{
-				{watch.Deleted, mkPod("foo", "4")},
-				{watch.Added, mkPod("qux", "5")},
+				{Type: watch.Deleted, Object: mkPod("foo", "4")},
+				{Type: watch.Added, Object: mkPod("qux", "5")},
 			},
 		}, {
 			listErr: fmt.Errorf("a list error"),
@@ -309,7 +303,7 @@ func TestReflector_listAndWatchWithErrors(t *testing.T) {
 		}, {
 			list: mkList("5", mkPod("bar", "3"), mkPod("qux", "5")),
 			events: []watch.Event{
-				{watch.Added, mkPod("baz", "6")},
+				{Type: watch.Added, Object: mkPod("baz", "6")},
 			},
 		}, {
 			list: mkList("6", mkPod("bar", "3"), mkPod("qux", "5"), mkPod("baz", "6")),
@@ -337,7 +331,7 @@ func TestReflector_listAndWatchWithErrors(t *testing.T) {
 		}
 		watchRet, watchErr := item.events, item.watchErr
 		lw := &testLW{
-			WatchFunc: func(rv string) (watch.Interface, error) {
+			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
 				if watchErr != nil {
 					return nil, watchErr
 				}
@@ -351,11 +345,45 @@ func TestReflector_listAndWatchWithErrors(t *testing.T) {
 				}()
 				return fw, nil
 			},
-			ListFunc: func() (runtime.Object, error) {
+			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
 				return item.list, item.listErr
 			},
 		}
 		r := NewReflector(lw, &api.Pod{}, s, 0)
-		r.listAndWatch(util.NeverStop)
+		r.ListAndWatch(wait.NeverStop)
+	}
+}
+
+func TestReflectorResync(t *testing.T) {
+	iteration := 0
+	stopCh := make(chan struct{})
+	rerr := errors.New("expected resync reached")
+	s := &FakeCustomStore{
+		ResyncFunc: func() error {
+			iteration++
+			if iteration == 2 {
+				return rerr
+			}
+			return nil
+		},
+	}
+
+	lw := &testLW{
+		WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
+			fw := watch.NewFake()
+			return fw, nil
+		},
+		ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+			return &api.PodList{ListMeta: unversioned.ListMeta{ResourceVersion: "0"}}, nil
+		},
+	}
+	resyncPeriod := 1 * time.Millisecond
+	r := NewReflector(lw, &api.Pod{}, s, resyncPeriod)
+	if err := r.ListAndWatch(stopCh); err != nil {
+		// error from Resync is not propaged up to here.
+		t.Errorf("expected error %v", err)
+	}
+	if iteration != 2 {
+		t.Errorf("exactly 2 iterations were expected, got: %v", iteration)
 	}
 }

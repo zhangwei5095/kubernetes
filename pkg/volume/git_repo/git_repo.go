@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,186 +20,250 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/exec"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/mount"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/volume"
-	volumeutil "github.com/GoogleCloudPlatform/kubernetes/pkg/volume/util"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/kubernetes/pkg/util/exec"
+	utilstrings "k8s.io/kubernetes/pkg/util/strings"
+	"k8s.io/kubernetes/pkg/volume"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 )
 
 // This is the primary entrypoint for volume plugins.
 func ProbeVolumePlugins() []volume.VolumePlugin {
-	return []volume.VolumePlugin{&gitRepoPlugin{nil, false}, &gitRepoPlugin{nil, true}}
+	return []volume.VolumePlugin{&gitRepoPlugin{nil}}
 }
 
 type gitRepoPlugin struct {
-	host       volume.VolumeHost
-	legacyMode bool // if set, plugin answers to the legacy name
+	host volume.VolumeHost
 }
 
 var _ volume.VolumePlugin = &gitRepoPlugin{}
 
-const (
-	gitRepoPluginName       = "kubernetes.io/git-repo"
-	gitRepoPluginLegacyName = "git"
-)
-
-func (plugin *gitRepoPlugin) Init(host volume.VolumeHost) {
-	plugin.host = host
+func wrappedVolumeSpec() volume.Spec {
+	return volume.Spec{
+		Volume: &api.Volume{VolumeSource: api.VolumeSource{EmptyDir: &api.EmptyDirVolumeSource{}}},
+	}
 }
 
-func (plugin *gitRepoPlugin) Name() string {
-	if plugin.legacyMode {
-		return gitRepoPluginLegacyName
-	}
+const (
+	gitRepoPluginName = "kubernetes.io/git-repo"
+)
+
+func (plugin *gitRepoPlugin) Init(host volume.VolumeHost) error {
+	plugin.host = host
+	return nil
+}
+
+func (plugin *gitRepoPlugin) GetPluginName() string {
 	return gitRepoPluginName
 }
 
+func (plugin *gitRepoPlugin) GetVolumeName(spec *volume.Spec) (string, error) {
+	volumeSource, _ := getVolumeSource(spec)
+	if volumeSource == nil {
+		return "", fmt.Errorf("Spec does not reference a Git repo volume type")
+	}
+
+	return fmt.Sprintf(
+		"%v:%v:%v",
+		volumeSource.Repository,
+		volumeSource.Revision,
+		volumeSource.Directory), nil
+}
+
 func (plugin *gitRepoPlugin) CanSupport(spec *volume.Spec) bool {
-	if plugin.legacyMode {
-		// Legacy mode instances can be cleaned up but not created anew.
-		return false
-	}
-
-	return spec.VolumeSource.GitRepo != nil
+	return spec.Volume != nil && spec.Volume.GitRepo != nil
 }
 
-func (plugin *gitRepoPlugin) NewBuilder(spec *volume.Spec, pod *api.Pod, opts volume.VolumeOptions, mounter mount.Interface) (volume.Builder, error) {
-	if plugin.legacyMode {
-		// Legacy mode instances can be cleaned up but not created anew.
-		return nil, fmt.Errorf("legacy mode: can not create new instances")
-	}
-	return &gitRepo{
-		pod:        *pod,
-		volName:    spec.Name,
-		source:     spec.VolumeSource.GitRepo.Repository,
-		revision:   spec.VolumeSource.GitRepo.Revision,
-		exec:       exec.New(),
-		plugin:     plugin,
-		legacyMode: false,
-		opts:       opts,
-		mounter:    mounter,
+func (plugin *gitRepoPlugin) RequiresRemount() bool {
+	return false
+}
+
+func (plugin *gitRepoPlugin) NewMounter(spec *volume.Spec, pod *api.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+	return &gitRepoVolumeMounter{
+		gitRepoVolume: &gitRepoVolume{
+			volName: spec.Name(),
+			podUID:  pod.UID,
+			plugin:  plugin,
+		},
+		pod:      *pod,
+		source:   spec.Volume.GitRepo.Repository,
+		revision: spec.Volume.GitRepo.Revision,
+		target:   spec.Volume.GitRepo.Directory,
+		exec:     exec.New(),
+		opts:     opts,
 	}, nil
 }
 
-func (plugin *gitRepoPlugin) NewCleaner(volName string, podUID types.UID, mounter mount.Interface) (volume.Cleaner, error) {
-	legacy := false
-	if plugin.legacyMode {
-		legacy = true
-	}
-	return &gitRepo{
-		pod:        api.Pod{ObjectMeta: api.ObjectMeta{UID: podUID}},
-		volName:    volName,
-		plugin:     plugin,
-		legacyMode: legacy,
-		mounter:    mounter,
+func (plugin *gitRepoPlugin) NewUnmounter(volName string, podUID types.UID) (volume.Unmounter, error) {
+	return &gitRepoVolumeUnmounter{
+		&gitRepoVolume{
+			volName: volName,
+			podUID:  podUID,
+			plugin:  plugin,
+		},
 	}, nil
+}
+
+func (plugin *gitRepoPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+	gitVolume := &api.Volume{
+		Name: volumeName,
+		VolumeSource: api.VolumeSource{
+			GitRepo: &api.GitRepoVolumeSource{},
+		},
+	}
+	return volume.NewSpecFromVolume(gitVolume), nil
 }
 
 // gitRepo volumes are directories which are pre-filled from a git repository.
 // These do not persist beyond the lifetime of a pod.
-type gitRepo struct {
-	volName    string
-	pod        api.Pod
-	source     string
-	revision   string
-	exec       exec.Interface
-	plugin     *gitRepoPlugin
-	legacyMode bool
-	opts       volume.VolumeOptions
-	mounter    mount.Interface
+type gitRepoVolume struct {
+	volName string
+	podUID  types.UID
+	plugin  *gitRepoPlugin
+	volume.MetricsNil
+}
+
+var _ volume.Volume = &gitRepoVolume{}
+
+func (gr *gitRepoVolume) GetPath() string {
+	name := gitRepoPluginName
+	return gr.plugin.host.GetPodVolumeDir(gr.podUID, utilstrings.EscapeQualifiedNameForDisk(name), gr.volName)
+}
+
+// gitRepoVolumeMounter builds git repo volumes.
+type gitRepoVolumeMounter struct {
+	*gitRepoVolume
+
+	pod      api.Pod
+	source   string
+	revision string
+	target   string
+	exec     exec.Interface
+	opts     volume.VolumeOptions
+}
+
+var _ volume.Mounter = &gitRepoVolumeMounter{}
+
+func (b *gitRepoVolumeMounter) GetAttributes() volume.Attributes {
+	return volume.Attributes{
+		ReadOnly:        false,
+		Managed:         true,
+		SupportsSELinux: true, // xattr change should be okay, TODO: double check
+	}
 }
 
 // SetUp creates new directory and clones a git repo.
-func (gr *gitRepo) SetUp() error {
-	return gr.SetUpAt(gr.GetPath())
-}
-
-// This is the spec for the volume that this plugin wraps.
-var wrappedVolumeSpec = &volume.Spec{
-	Name:         "not-used",
-	VolumeSource: api.VolumeSource{EmptyDir: &api.EmptyDirVolumeSource{}},
+func (b *gitRepoVolumeMounter) SetUp(fsGroup *int64) error {
+	return b.SetUpAt(b.GetPath(), fsGroup)
 }
 
 // SetUpAt creates new directory and clones a git repo.
-func (gr *gitRepo) SetUpAt(dir string) error {
-	if volumeutil.IsReady(gr.getMetaDir()) {
+func (b *gitRepoVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
+	if volumeutil.IsReady(b.getMetaDir()) {
 		return nil
-	}
-	if gr.legacyMode {
-		return fmt.Errorf("legacy mode: can not create new instances")
 	}
 
 	// Wrap EmptyDir, let it do the setup.
-	wrapped, err := gr.plugin.host.NewWrapperBuilder(wrappedVolumeSpec, &gr.pod, gr.opts, gr.mounter)
+	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod, b.opts)
 	if err != nil {
 		return err
 	}
-	if err := wrapped.SetUpAt(dir); err != nil {
+	if err := wrapped.SetUpAt(dir, fsGroup); err != nil {
 		return err
 	}
 
-	if output, err := gr.execCommand("git", []string{"clone", gr.source}, dir); err != nil {
-		return fmt.Errorf("failed to exec 'git clone %s': %s: %v", gr.source, output, err)
+	args := []string{"clone", b.source}
+
+	if len(b.target) != 0 {
+		args = append(args, b.target)
+	}
+	if output, err := b.execCommand("git", args, dir); err != nil {
+		return fmt.Errorf("failed to exec 'git %s': %s: %v",
+			strings.Join(args, " "), output, err)
 	}
 
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	if len(files) != 1 {
-		return fmt.Errorf("unexpected directory contents: %v", files)
-	}
-	if len(gr.revision) == 0 {
+
+	if len(b.revision) == 0 {
 		// Done!
-		volumeutil.SetReady(gr.getMetaDir())
+		volumeutil.SetReady(b.getMetaDir())
 		return nil
 	}
 
-	subdir := path.Join(dir, files[0].Name())
-	if output, err := gr.execCommand("git", []string{"checkout", gr.revision}, subdir); err != nil {
-		return fmt.Errorf("failed to exec 'git checkout %s': %s: %v", gr.revision, output, err)
+	var subdir string
+
+	switch {
+	case b.target == ".":
+		// if target dir is '.', use the current dir
+		subdir = path.Join(dir)
+	case len(files) == 1:
+		// if target is not '.', use the generated folder
+		subdir = path.Join(dir, files[0].Name())
+	default:
+		// if target is not '.', but generated many files, it's wrong
+		return fmt.Errorf("unexpected directory contents: %v", files)
 	}
-	if output, err := gr.execCommand("git", []string{"reset", "--hard"}, subdir); err != nil {
+
+	if output, err := b.execCommand("git", []string{"checkout", b.revision}, subdir); err != nil {
+		return fmt.Errorf("failed to exec 'git checkout %s': %s: %v", b.revision, output, err)
+	}
+	if output, err := b.execCommand("git", []string{"reset", "--hard"}, subdir); err != nil {
 		return fmt.Errorf("failed to exec 'git reset --hard': %s: %v", output, err)
 	}
 
-	volumeutil.SetReady(gr.getMetaDir())
+	volume.SetVolumeOwnership(b, fsGroup)
+
+	volumeutil.SetReady(b.getMetaDir())
 	return nil
 }
 
-func (gr *gitRepo) getMetaDir() string {
-	return path.Join(gr.plugin.host.GetPodPluginDir(gr.pod.UID, util.EscapeQualifiedNameForDisk(gitRepoPluginName)), gr.volName)
+func (b *gitRepoVolumeMounter) getMetaDir() string {
+	return path.Join(b.plugin.host.GetPodPluginDir(b.podUID, utilstrings.EscapeQualifiedNameForDisk(gitRepoPluginName)), b.volName)
 }
 
-func (gr *gitRepo) execCommand(command string, args []string, dir string) ([]byte, error) {
-	cmd := gr.exec.Command(command, args...)
+func (b *gitRepoVolumeMounter) execCommand(command string, args []string, dir string) ([]byte, error) {
+	cmd := b.exec.Command(command, args...)
 	cmd.SetDir(dir)
 	return cmd.CombinedOutput()
 }
 
-func (gr *gitRepo) GetPath() string {
-	name := gitRepoPluginName
-	if gr.legacyMode {
-		name = gitRepoPluginLegacyName
-	}
-	return gr.plugin.host.GetPodVolumeDir(gr.pod.UID, util.EscapeQualifiedNameForDisk(name), gr.volName)
+// gitRepoVolumeUnmounter cleans git repo volumes.
+type gitRepoVolumeUnmounter struct {
+	*gitRepoVolume
 }
 
+var _ volume.Unmounter = &gitRepoVolumeUnmounter{}
+
 // TearDown simply deletes everything in the directory.
-func (gr *gitRepo) TearDown() error {
-	return gr.TearDownAt(gr.GetPath())
+func (c *gitRepoVolumeUnmounter) TearDown() error {
+	return c.TearDownAt(c.GetPath())
 }
 
 // TearDownAt simply deletes everything in the directory.
-func (gr *gitRepo) TearDownAt(dir string) error {
+func (c *gitRepoVolumeUnmounter) TearDownAt(dir string) error {
+
 	// Wrap EmptyDir, let it do the teardown.
-	wrapped, err := gr.plugin.host.NewWrapperCleaner(wrappedVolumeSpec, gr.pod.UID, gr.mounter)
+	wrapped, err := c.plugin.host.NewWrapperUnmounter(c.volName, wrappedVolumeSpec(), c.podUID)
 	if err != nil {
 		return err
 	}
 	return wrapped.TearDownAt(dir)
+}
+
+func getVolumeSource(spec *volume.Spec) (*api.GitRepoVolumeSource, bool) {
+	var readOnly bool
+	var volumeSource *api.GitRepoVolumeSource
+
+	if spec.Volume != nil && spec.Volume.GitRepo != nil {
+		volumeSource = spec.Volume.GitRepo
+		readOnly = spec.ReadOnly
+	}
+
+	return volumeSource, readOnly
 }

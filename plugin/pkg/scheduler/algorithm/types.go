@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,38 +17,37 @@ limitations under the License.
 package algorithm
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api"
+	schedulerapi "k8s.io/kubernetes/plugin/pkg/scheduler/api"
+	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
 // FitPredicate is a function that indicates if a pod fits into an existing node.
-type FitPredicate func(pod *api.Pod, existingPods []*api.Pod, node string) (bool, error)
+// The failure information is given by the error.
+type FitPredicate func(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (bool, []PredicateFailureReason, error)
 
-// HostPriority represents the priority of scheduling to a particular host, lower priority is better.
-type HostPriority struct {
-	Host  string
-	Score int
-}
+// PriorityMapFunction is a function that computes per-node results for a given node.
+// TODO: Figure out the exact API of this method.
+type PriorityMapFunction func(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error)
 
-type HostPriorityList []HostPriority
+// PriorityReduceFunction is a function that aggregated per-node results and computes
+// final scores for all nodes.
+// TODO: Figure out the exact API of this method.
+type PriorityReduceFunction func(result schedulerapi.HostPriorityList) error
 
-func (h HostPriorityList) Len() int {
-	return len(h)
-}
-
-func (h HostPriorityList) Less(i, j int) bool {
-	if h[i].Score == h[j].Score {
-		return h[i].Host < h[j].Host
-	}
-	return h[i].Score < h[j].Score
-}
-
-func (h HostPriorityList) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-type PriorityFunction func(pod *api.Pod, podLister PodLister, minionLister MinionLister) (HostPriorityList, error)
+// DEPRECATED
+// Use Map-Reduce pattern for priority functions.
+type PriorityFunction func(pod *api.Pod, nodeNameToInfo map[string]*schedulercache.NodeInfo, nodes []*api.Node) (schedulerapi.HostPriorityList, error)
 
 type PriorityConfig struct {
+	Map    PriorityMapFunction
+	Reduce PriorityReduceFunction
+	// TODO: Remove it after migrating all functions to
+	// Map-Reduce pattern.
 	Function PriorityFunction
 	Weight   int
+}
+
+type PredicateFailureReason interface {
+	GetReason() string
 }

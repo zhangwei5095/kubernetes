@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,31 +19,72 @@ package kubectl
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
-type ServiceGenerator struct{}
+// The only difference between ServiceGeneratorV1 and V2 is that the service port is named "default" in V1, while it is left unnamed in V2.
+type ServiceGeneratorV1 struct{}
 
-func (ServiceGenerator) ParamNames() []GeneratorParam {
+func (ServiceGeneratorV1) ParamNames() []GeneratorParam {
+	return paramNames()
+}
+
+func (ServiceGeneratorV1) Generate(params map[string]interface{}) (runtime.Object, error) {
+	params["port-name"] = "default"
+	return generate(params)
+}
+
+type ServiceGeneratorV2 struct{}
+
+func (ServiceGeneratorV2) ParamNames() []GeneratorParam {
+	return paramNames()
+}
+
+func (ServiceGeneratorV2) Generate(params map[string]interface{}) (runtime.Object, error) {
+	return generate(params)
+}
+
+func paramNames() []GeneratorParam {
 	return []GeneratorParam{
 		{"default-name", true},
 		{"name", false},
 		{"selector", true},
-		{"port", true},
+		// port will be used if a user specifies --port OR the exposed object
+		// has one port
+		{"port", false},
+		// ports will be used iff a user doesn't specify --port AND the
+		// exposed object has multiple ports
+		{"ports", false},
 		{"labels", false},
-		{"public-ip", false},
+		{"external-ip", false},
 		{"create-external-load-balancer", false},
+		{"load-balancer-ip", false},
 		{"type", false},
 		{"protocol", false},
+		// protocols will be used to keep port-protocol mapping derived from
+		// exposed object
+		{"protocols", false},
 		{"container-port", false}, // alias of target-port
 		{"target-port", false},
+		{"port-name", false},
+		{"session-affinity", false},
+		{"cluster-ip", false},
 	}
 }
 
-func (ServiceGenerator) Generate(params map[string]string) (runtime.Object, error) {
+func generate(genericParams map[string]interface{}) (runtime.Object, error) {
+	params := map[string]string{}
+	for key, value := range genericParams {
+		strVal, isString := value.(string)
+		if !isString {
+			return nil, fmt.Errorf("expected string, saw %v for '%s'", value, key)
+		}
+		params[key] = strVal
+	}
 	selectorString, found := params["selector"]
 	if !found || len(selectorString) == 0 {
 		return nil, fmt.Errorf("'selector' is a required parameter.")
@@ -69,14 +110,67 @@ func (ServiceGenerator) Generate(params map[string]string) (runtime.Object, erro
 			return nil, fmt.Errorf("'name' is a required parameter.")
 		}
 	}
-	portString, found := params["port"]
+	ports := []api.ServicePort{}
+	servicePortName, found := params["port-name"]
 	if !found {
-		return nil, fmt.Errorf("'port' is a required parameter.")
+		// Leave the port unnamed.
+		servicePortName = ""
 	}
-	port, err := strconv.Atoi(portString)
-	if err != nil {
-		return nil, err
+
+	protocolsString, found := params["protocols"]
+	var portProtocolMap map[string]string
+	if found && len(protocolsString) > 0 {
+		portProtocolMap, err = ParseProtocols(protocolsString)
+		if err != nil {
+			return nil, err
+		}
 	}
+	// ports takes precedence over port since it will be
+	// specified only when the user hasn't specified a port
+	// via --port and the exposed object has multiple ports.
+	var portString string
+	if portString, found = params["ports"]; !found {
+		portString, found = params["port"]
+		if !found {
+			return nil, fmt.Errorf("'port' is a required parameter.")
+		}
+	}
+
+	portStringSlice := strings.Split(portString, ",")
+	for i, stillPortString := range portStringSlice {
+		port, err := strconv.Atoi(stillPortString)
+		if err != nil {
+			return nil, err
+		}
+		name := servicePortName
+		// If we are going to assign multiple ports to a service, we need to
+		// generate a different name for each one.
+		if len(portStringSlice) > 1 {
+			name = fmt.Sprintf("port-%d", i+1)
+		}
+		protocol := params["protocol"]
+
+		switch {
+		case len(protocol) == 0 && len(portProtocolMap) == 0:
+			// Default to TCP, what the flag was doing previously.
+			protocol = "TCP"
+		case len(protocol) > 0 && len(portProtocolMap) > 0:
+			// User has specified the --protocol while exposing a multiprotocol resource
+			// We should stomp multiple protocols with the one specified ie. do nothing
+		case len(protocol) == 0 && len(portProtocolMap) > 0:
+			// no --protocol and we expose a multiprotocol resource
+			protocol = "TCP" // have the default so we can stay sane
+			if exposeProtocol, found := portProtocolMap[stillPortString]; found {
+				protocol = exposeProtocol
+			}
+		}
+		ports = append(ports, api.ServicePort{
+			Name:     name,
+			Port:     int32(port),
+			Protocol: api.Protocol(protocol),
+		})
+	}
+
 	service := api.Service{
 		ObjectMeta: api.ObjectMeta{
 			Name:   name,
@@ -84,36 +178,60 @@ func (ServiceGenerator) Generate(params map[string]string) (runtime.Object, erro
 		},
 		Spec: api.ServiceSpec{
 			Selector: selector,
-			Ports: []api.ServicePort{
-				{
-					Name:     "default",
-					Port:     port,
-					Protocol: api.Protocol(params["protocol"]),
-				},
-			},
+			Ports:    ports,
 		},
 	}
-	targetPort, found := params["target-port"]
-	if !found {
-		targetPort, found = params["container-port"]
+	targetPortString := params["target-port"]
+	if len(targetPortString) == 0 {
+		targetPortString = params["container-port"]
 	}
-	if found && len(targetPort) > 0 {
-		if portNum, err := strconv.Atoi(targetPort); err != nil {
-			service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromString(targetPort)
+	if len(targetPortString) > 0 {
+		var targetPort intstr.IntOrString
+		if portNum, err := strconv.Atoi(targetPortString); err != nil {
+			targetPort = intstr.FromString(targetPortString)
 		} else {
-			service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromInt(portNum)
+			targetPort = intstr.FromInt(portNum)
+		}
+		// Use the same target-port for every port
+		for i := range service.Spec.Ports {
+			service.Spec.Ports[i].TargetPort = targetPort
 		}
 	} else {
-		service.Spec.Ports[0].TargetPort = util.NewIntOrStringFromInt(port)
+		// If --target-port or --container-port haven't been specified, this
+		// should be the same as Port
+		for i := range service.Spec.Ports {
+			port := service.Spec.Ports[i].Port
+			service.Spec.Ports[i].TargetPort = intstr.FromInt(int(port))
+		}
 	}
 	if params["create-external-load-balancer"] == "true" {
 		service.Spec.Type = api.ServiceTypeLoadBalancer
 	}
-	if len(params["public-ip"]) != 0 {
-		service.Spec.DeprecatedPublicIPs = []string{params["public-ip"]}
+	if len(params["external-ip"]) > 0 {
+		service.Spec.ExternalIPs = []string{params["external-ip"]}
 	}
 	if len(params["type"]) != 0 {
 		service.Spec.Type = api.ServiceType(params["type"])
+	}
+	if service.Spec.Type == api.ServiceTypeLoadBalancer {
+		service.Spec.LoadBalancerIP = params["load-balancer-ip"]
+	}
+	if len(params["session-affinity"]) != 0 {
+		switch api.ServiceAffinity(params["session-affinity"]) {
+		case api.ServiceAffinityNone:
+			service.Spec.SessionAffinity = api.ServiceAffinityNone
+		case api.ServiceAffinityClientIP:
+			service.Spec.SessionAffinity = api.ServiceAffinityClientIP
+		default:
+			return nil, fmt.Errorf("unknown session affinity: %s", params["session-affinity"])
+		}
+	}
+	if len(params["cluster-ip"]) != 0 {
+		if params["cluster-ip"] == "None" {
+			service.Spec.ClusterIP = api.ClusterIPNone
+		} else {
+			service.Spec.ClusterIP = params["cluster-ip"]
+		}
 	}
 	return &service, nil
 }

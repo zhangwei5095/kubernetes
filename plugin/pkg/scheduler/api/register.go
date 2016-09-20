@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,38 @@ limitations under the License.
 package api
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/runtime"
 )
 
 // Scheme is the default instance of runtime.Scheme to which types in the Kubernetes API are already registered.
+// TODO: remove this, scheduler should not have its own scheme.
 var Scheme = runtime.NewScheme()
 
+// SchemeGroupVersion is group version used to register these objects
+// TODO this should be in the "scheduler" group
+var SchemeGroupVersion = unversioned.GroupVersion{Group: "", Version: runtime.APIVersionInternal}
+
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+
 func init() {
-	Scheme.AddKnownTypes("",
-		&Policy{},
-	)
+	if err := addKnownTypes(Scheme); err != nil {
+		// Programmer error.
+		panic(err)
+	}
 }
 
-func (*Policy) IsAnAPIObject() {}
+func addKnownTypes(scheme *runtime.Scheme) error {
+	if err := scheme.AddIgnoredConversionType(&unversioned.TypeMeta{}, &unversioned.TypeMeta{}); err != nil {
+		return err
+	}
+	scheme.AddKnownTypes(SchemeGroupVersion,
+		&Policy{},
+	)
+	return nil
+}
+
+func (obj *Policy) GetObjectKind() unversioned.ObjectKind { return &obj.TypeMeta }

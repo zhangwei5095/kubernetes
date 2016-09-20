@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,34 +24,55 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/api"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/pkg/util/wait"
 
 	"github.com/golang/glog"
 )
 
 type sourceURL struct {
-	url      string
-	nodeName string
-	updates  chan<- interface{}
-	data     []byte
+	url         string
+	header      http.Header
+	nodeName    string
+	updates     chan<- interface{}
+	data        []byte
+	failureLogs int
+	client      *http.Client
 }
 
-func NewSourceURL(url, nodeName string, period time.Duration, updates chan<- interface{}) {
+func NewSourceURL(url string, header http.Header, nodeName string, period time.Duration, updates chan<- interface{}) {
 	config := &sourceURL{
 		url:      url,
+		header:   header,
 		nodeName: nodeName,
 		updates:  updates,
 		data:     nil,
+		// Timing out requests leads to retries. This client is only used to
+		// read the manifest URL passed to kubelet.
+		client: &http.Client{Timeout: 10 * time.Second},
 	}
 	glog.V(1).Infof("Watching URL %s", url)
-	go util.Forever(config.run, period)
+	go wait.Until(config.run, period, wait.NeverStop)
 }
 
 func (s *sourceURL) run() {
 	if err := s.extractFromURL(); err != nil {
-		glog.Errorf("Failed to read URL: %v", err)
+		// Don't log this multiple times per minute. The first few entries should be
+		// enough to get the point across.
+		if s.failureLogs < 3 {
+			glog.Warningf("Failed to read pods from URL: %v", err)
+		} else if s.failureLogs == 3 {
+			glog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
+		} else {
+			glog.V(4).Infof("Failed to read pods from URL: %v", err)
+		}
+		s.failureLogs++
+	} else {
+		if s.failureLogs > 0 {
+			glog.Info("Successfully read pods from URL.")
+			s.failureLogs = 0
+		}
 	}
 }
 
@@ -60,7 +81,12 @@ func (s *sourceURL) applyDefaults(pod *api.Pod) error {
 }
 
 func (s *sourceURL) extractFromURL() error {
-	resp, err := http.Get(s.url)
+	req, err := http.NewRequest("GET", s.url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = s.header
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -74,7 +100,7 @@ func (s *sourceURL) extractFromURL() error {
 	}
 	if len(data) == 0 {
 		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
-		s.updates <- kubelet.PodUpdate{[]*api.Pod{}, kubelet.SET, kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*api.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return fmt.Errorf("zero-length data received from %v", s.url)
 	}
 	// Short circuit if the data has not changed since the last time it was read.
@@ -90,7 +116,7 @@ func (s *sourceURL) extractFromURL() error {
 			// It parsed but could not be used.
 			return singlePodErr
 		}
-		s.updates <- kubelet.PodUpdate{[]*api.Pod{pod}, kubelet.SET, kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*api.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return nil
 	}
 
@@ -105,7 +131,7 @@ func (s *sourceURL) extractFromURL() error {
 		for i := range podList.Items {
 			pods = append(pods, &podList.Items[i])
 		}
-		s.updates <- kubelet.PodUpdate{pods, kubelet.SET, kubelet.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return nil
 	}
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,75 +14,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# A library of helper functions that each provider hosting Kubernetes must implement to use cluster/kube-*.sh scripts.
+# This script will source the default skeleton helper functions, then sources
+# cluster/${KUBERNETES_PROVIDER}/util.sh where KUBERNETES_PROVIDER, if unset,
+# will use its default value (gce).
 
-# Must ensure that the following ENV vars are set
-function detect-master {
-	echo "KUBE_MASTER_IP: $KUBE_MASTER_IP"
-	echo "KUBE_MASTER: $KUBE_MASTER"
-}
+KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
 
-# Get minion names if they are not static.
-function detect-minion-names {
-        echo "MINION_NAMES: ${MINION_NAMES[*]}"
-}
+source "${KUBE_ROOT}/cluster/skeleton/util.sh"
 
-# Get minion IP addresses and store in KUBE_MINION_IP_ADDRESSES[]
-function detect-minions {
-	echo "KUBE_MINION_IP_ADDRESSES=[]"
-}
+if [[ -n "${KUBERNETES_CONFORMANCE_TEST:-}" ]]; then
+    KUBERNETES_PROVIDER=""
+else
+    KUBERNETES_PROVIDER="${KUBERNETES_PROVIDER:-gce}"
+fi
 
-# Verify prereqs on host machine
-function verify-prereqs {
-	echo "TODO"
-}
+PROVIDER_UTILS="${KUBE_ROOT}/cluster/${KUBERNETES_PROVIDER}/util.sh"
+if [ -f ${PROVIDER_UTILS} ]; then
+    source "${PROVIDER_UTILS}"
+fi
 
-# Instantiate a kubernetes cluster
-function kube-up {
-	echo "TODO"
-}
+# Federation utils
 
-# Delete a kubernetes cluster
-function kube-down {
-	echo "TODO"
-}
+# Should NOT be called within the global scope, unless setting the desired global zone vars
+# This function is currently NOT USED in the global scope
+function set-federation-zone-vars {
+    zone="$1"
+    export OVERRIDE_CONTEXT="federation-e2e-${KUBERNETES_PROVIDER}-$zone"
+    echo "Setting zone vars to: $OVERRIDE_CONTEXT"
+    if [[ "$KUBERNETES_PROVIDER" == "gce"  ]];then
 
-# Update a kubernetes cluster
-function kube-push {
-	echo "TODO"
-}
+	export KUBE_GCE_ZONE="$zone"
+	# gcloud has a 61 character limit, and for firewall rules this
+	# prefix gets appended to itself, with some extra information
+	# need tot keep it short
+	export KUBE_GCE_INSTANCE_PREFIX="${USER}-${zone}"
 
-# Prepare update a kubernetes component
-function prepare-push {
-	echo "TODO"
-}
+    elif [[ "$KUBERNETES_PROVIDER" == "gke"  ]];then
 
-# Update a kubernetes master
-function push-master {
-	echo "TODO"
-}
+	export CLUSTER_NAME="${USER}-${zone}"
 
-# Update a kubernetes node
-function push-node {
-	echo "TODO"
-}
+    elif [[ "$KUBERNETES_PROVIDER" == "aws"  ]];then
 
-# Execute prior to running tests to build a release if required for env
-function test-build-release {
-	echo "TODO"
-}
-
-# Execute prior to running tests to initialize required structure
-function test-setup {
-	echo "TODO"
-}
-
-# Execute after running tests to perform any required clean-up
-function test-teardown {
-	echo "TODO"
-}
-
-# Set the {KUBE_USER} and {KUBE_PASSWORD} environment values required to interact with provider
-function get-password {
-	echo "TODO"
+	export KUBE_AWS_ZONE="$zone"
+	export KUBE_AWS_INSTANCE_PREFIX="${USER}-${zone}"
+    else
+	echo "Provider \"${KUBERNETES_PROVIDER}\" is not supported"
+	exit 1
+    fi
 }

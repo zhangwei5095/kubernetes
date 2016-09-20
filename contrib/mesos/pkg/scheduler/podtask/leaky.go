@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ package podtask
 // Concepts that have leaked to where they should not have.
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/etcd"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
 )
 
 // makePodKey constructs etcd paths to pod items enforcing namespace rules.
 func MakePodKey(ctx api.Context, id string) (string, error) {
-	return etcd.MakeEtcdItemKey(ctx, PodPath, id)
+	return registry.NamespaceKeyFunc(ctx, PodPath, id)
 }

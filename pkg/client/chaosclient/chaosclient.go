@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,6 +28,8 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+
+	"k8s.io/kubernetes/pkg/util/net"
 )
 
 // chaosrt provides the ability to perform simulations of HTTP client failures
@@ -86,6 +88,12 @@ func (rt *chaosrt) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rt.rt.RoundTrip(req)
 }
 
+var _ = net.RoundTripperWrapper(&chaosrt{})
+
+func (rt *chaosrt) WrappedRoundTripper() http.RoundTripper {
+	return rt.rt
+}
+
 // Seed represents a consistent stream of chaos.
 type Seed struct {
 	*rand.Rand
@@ -103,7 +111,7 @@ type pIntercept struct {
 	p float64
 }
 
-// P returns a ChaosFunc that fires with a probabilty of p (p between 0.0
+// P returns a ChaosFunc that fires with a probability of p (p between 0.0
 // and 1.0 with 0.0 meaning never and 1.0 meaning always).
 func (s Seed) P(p float64, c Chaos) Chaos {
 	return pIntercept{c, s, p}

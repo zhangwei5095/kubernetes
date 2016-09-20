@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,18 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package serviceaccount
+package serviceaccount_test
 
 import (
 	"crypto/rsa"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/testclient"
 	"github.com/dgrijalva/jwt-go"
+
+	"k8s.io/kubernetes/pkg/api"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
+	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
+	"k8s.io/kubernetes/pkg/serviceaccount"
 )
 
 const otherPublicKey = `-----BEGIN PUBLIC KEY-----
@@ -96,11 +100,11 @@ func TestReadPrivateKey(t *testing.T) {
 	defer os.Remove(f.Name())
 
 	if err := ioutil.WriteFile(f.Name(), []byte(privateKey), os.FileMode(0600)); err != nil {
-		t.Fatalf("error creating tmpfile: %v", err)
+		t.Fatalf("error writing private key to tmpfile: %v", err)
 	}
 
-	if _, err := ReadPrivateKey(f.Name()); err != nil {
-		t.Fatalf("error reading key: %v", err)
+	if _, err := serviceaccount.ReadPrivateKey(f.Name()); err != nil {
+		t.Fatalf("error reading private key: %v", err)
 	}
 }
 
@@ -112,11 +116,11 @@ func TestReadPublicKey(t *testing.T) {
 	defer os.Remove(f.Name())
 
 	if err := ioutil.WriteFile(f.Name(), []byte(publicKey), os.FileMode(0600)); err != nil {
-		t.Fatalf("error creating tmpfile: %v", err)
+		t.Fatalf("error writing public key to tmpfile: %v", err)
 	}
 
-	if _, err := ReadPublicKey(f.Name()); err != nil {
-		t.Fatalf("error reading key: %v", err)
+	if _, err := serviceaccount.ReadPublicKey(f.Name()); err != nil {
+		t.Fatalf("error reading public key: %v", err)
 	}
 }
 
@@ -140,7 +144,7 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 	}
 
 	// Generate the token
-	generator := JWTTokenGenerator(getPrivateKey(privateKey))
+	generator := serviceaccount.JWTTokenGenerator(getPrivateKey(privateKey))
 	token, err := generator.GenerateToken(*serviceAccount, *secret)
 	if err != nil {
 		t.Fatalf("error generating token: %v", err)
@@ -155,13 +159,14 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 	}
 
 	testCases := map[string]struct {
-		Client client.Interface
+		Client clientset.Interface
 		Keys   []*rsa.PublicKey
 
 		ExpectedErr      bool
 		ExpectedOK       bool
 		ExpectedUserName string
 		ExpectedUserUID  string
+		ExpectedGroups   []string
 	}{
 		"no keys": {
 			Client:      nil,
@@ -182,6 +187,7 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			ExpectedOK:       true,
 			ExpectedUserName: expectedUserName,
 			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
 		},
 		"rotated keys": {
 			Client:           nil,
@@ -190,23 +196,25 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			ExpectedOK:       true,
 			ExpectedUserName: expectedUserName,
 			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
 		},
 		"valid lookup": {
-			Client:           testclient.NewSimpleFake(serviceAccount, secret),
+			Client:           fake.NewSimpleClientset(serviceAccount, secret),
 			Keys:             []*rsa.PublicKey{getPublicKey(publicKey)},
 			ExpectedErr:      false,
 			ExpectedOK:       true,
 			ExpectedUserName: expectedUserName,
 			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
 		},
 		"invalid secret lookup": {
-			Client:      testclient.NewSimpleFake(serviceAccount),
+			Client:      fake.NewSimpleClientset(serviceAccount),
 			Keys:        []*rsa.PublicKey{getPublicKey(publicKey)},
 			ExpectedErr: true,
 			ExpectedOK:  false,
 		},
 		"invalid serviceaccount lookup": {
-			Client:      testclient.NewSimpleFake(secret),
+			Client:      fake.NewSimpleClientset(secret),
 			Keys:        []*rsa.PublicKey{getPublicKey(publicKey)},
 			ExpectedErr: true,
 			ExpectedOK:  false,
@@ -214,8 +222,14 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 	}
 
 	for k, tc := range testCases {
-		getter := NewGetterFromClient(tc.Client)
-		authenticator := JWTTokenAuthenticator(tc.Keys, tc.Client != nil, getter)
+		getter := serviceaccountcontroller.NewGetterFromClient(tc.Client)
+		authenticator := serviceaccount.JWTTokenAuthenticator(tc.Keys, tc.Client != nil, getter)
+
+		// An invalid, non-JWT token should always fail
+		if _, ok, err := authenticator.AuthenticateToken("invalid token"); err != nil || ok {
+			t.Errorf("%s: Expected err=nil, ok=false for non-JWT token", k)
+			continue
+		}
 
 		user, ok, err := authenticator.AuthenticateToken(token)
 		if (err != nil) != tc.ExpectedErr {
@@ -240,12 +254,16 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			t.Errorf("%s: Expected userUID=%v, got %v", k, tc.ExpectedUserUID, user.GetUID())
 			continue
 		}
+		if !reflect.DeepEqual(user.GetGroups(), tc.ExpectedGroups) {
+			t.Errorf("%s: Expected groups=%v, got %v", k, tc.ExpectedGroups, user.GetGroups())
+			continue
+		}
 	}
 }
 
 func TestMakeSplitUsername(t *testing.T) {
-	username := MakeUsername("ns", "name")
-	ns, name, err := SplitUsername(username)
+	username := serviceaccount.MakeUsername("ns", "name")
+	ns, name, err := serviceaccount.SplitUsername(username)
 	if err != nil {
 		t.Errorf("Unexpected error %v", err)
 	}
@@ -255,7 +273,7 @@ func TestMakeSplitUsername(t *testing.T) {
 
 	invalid := []string{"test", "system:serviceaccount", "system:serviceaccount:", "system:serviceaccount:ns", "system:serviceaccount:ns:name:extra"}
 	for _, n := range invalid {
-		_, _, err := SplitUsername("test")
+		_, _, err := serviceaccount.SplitUsername("test")
 		if err == nil {
 			t.Errorf("Expected error for %s", n)
 		}

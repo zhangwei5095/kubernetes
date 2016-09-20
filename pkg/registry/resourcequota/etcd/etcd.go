@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,47 +17,60 @@ limitations under the License.
 package etcd
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	etcdgeneric "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/resourcequota"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/rest"
+	"k8s.io/kubernetes/pkg/registry/cachesize"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
+	"k8s.io/kubernetes/pkg/registry/resourcequota"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/storage"
 )
 
-// rest implements a RESTStorage for resourcequotas against etcd
 type REST struct {
-	*etcdgeneric.Etcd
+	*registry.Store
 }
 
-// NewStorage returns a RESTStorage object that will work against ResourceQuota objects.
-func NewStorage(h tools.EtcdHelper) (*REST, *StatusREST) {
-	prefix := "/resourcequotas"
-	store := &etcdgeneric.Etcd{
+// NewREST returns a RESTStorage object that will work against resource quotas.
+func NewREST(opts generic.RESTOptions) (*REST, *StatusREST) {
+	prefix := "/" + opts.ResourcePrefix
+
+	newListFunc := func() runtime.Object { return &api.ResourceQuotaList{} }
+	storageInterface, dFunc := opts.Decorator(
+		opts.StorageConfig,
+		cachesize.GetWatchCacheSizeByResource(cachesize.ResourceQuotas),
+		&api.ResourceQuota{},
+		prefix,
+		resourcequota.Strategy,
+		newListFunc,
+		storage.NoTriggerPublisher,
+	)
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.ResourceQuota{} },
-		NewListFunc: func() runtime.Object { return &api.ResourceQuotaList{} },
+		NewListFunc: newListFunc,
 		KeyRootFunc: func(ctx api.Context) string {
-			return etcdgeneric.NamespaceKeyRootFunc(ctx, prefix)
+			return registry.NamespaceKeyRootFunc(ctx, prefix)
 		},
 		KeyFunc: func(ctx api.Context, name string) (string, error) {
-			return etcdgeneric.NamespaceKeyFunc(ctx, prefix, name)
+			return registry.NamespaceKeyFunc(ctx, prefix, name)
 		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.ResourceQuota).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return resourcequota.MatchResourceQuota(label, field)
-		},
-		EndpointName: "resourcequotas",
+		PredicateFunc:           resourcequota.MatchResourceQuota,
+		QualifiedResource:       api.Resource("resourcequotas"),
+		EnableGarbageCollection: opts.EnableGarbageCollection,
+		DeleteCollectionWorkers: opts.DeleteCollectionWorkers,
 
-		Helper: h,
+		CreateStrategy:      resourcequota.Strategy,
+		UpdateStrategy:      resourcequota.Strategy,
+		DeleteStrategy:      resourcequota.Strategy,
+		ReturnDeletedObject: true,
+
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
-
-	store.CreateStrategy = resourcequota.Strategy
-	store.UpdateStrategy = resourcequota.Strategy
-	store.ReturnDeletedObject = true
 
 	statusStore := *store
 	statusStore.UpdateStrategy = resourcequota.StatusStrategy
@@ -67,14 +80,19 @@ func NewStorage(h tools.EtcdHelper) (*REST, *StatusREST) {
 
 // StatusREST implements the REST endpoint for changing the status of a resourcequota.
 type StatusREST struct {
-	store *etcdgeneric.Etcd
+	store *registry.Store
 }
 
 func (r *StatusREST) New() runtime.Object {
 	return &api.ResourceQuota{}
 }
 
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *StatusREST) Get(ctx api.Context, name string) (runtime.Object, error) {
+	return r.store.Get(ctx, name)
+}
+
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx api.Context, obj runtime.Object) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, obj)
+func (r *StatusREST) Update(ctx api.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+	return r.store.Update(ctx, name, objInfo)
 }

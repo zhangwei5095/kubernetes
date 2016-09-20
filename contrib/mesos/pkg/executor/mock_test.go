@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,11 +19,20 @@ package executor
 import (
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet/dockertools"
 	"github.com/mesos/mesos-go/mesosproto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"k8s.io/kubernetes/pkg/kubelet/dockertools"
 )
+
+type mockKubeAPI struct {
+	mock.Mock
+}
+
+func (m *mockKubeAPI) killPod(ns, name string) error {
+	args := m.Called(ns, name)
+	return args.Error(0)
+}
 
 type MockExecutorDriver struct {
 	mock.Mock
@@ -64,10 +73,10 @@ func (m *MockExecutorDriver) SendFrameworkMessage(msg string) (mesosproto.Status
 	return args.Get(0).(mesosproto.Status), args.Error(1)
 }
 
-func NewTestKubernetesExecutor() *KubernetesExecutor {
+func NewTestKubernetesExecutor() *Executor {
 	return New(Config{
-		Docker:  dockertools.ConnectToDockerOrDie("fake://"),
-		Updates: make(chan interface{}, 1024),
+		Docker:   dockertools.CreateDockerClientOrDie("fake://", 0),
+		Registry: newFakeRegistry(),
 	})
 }
 

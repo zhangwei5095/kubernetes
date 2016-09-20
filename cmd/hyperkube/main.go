@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +23,9 @@ package main
 
 import (
 	"os"
+
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
+	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
 )
 
 func main() {
@@ -31,11 +34,16 @@ func main() {
 		Long: "This is an all-in-one binary that can run any of the various Kubernetes servers.",
 	}
 
+	hk.AddServer(NewKubectlServer())
 	hk.AddServer(NewKubeAPIServer())
 	hk.AddServer(NewKubeControllerManager())
 	hk.AddServer(NewScheduler())
 	hk.AddServer(NewKubelet())
 	hk.AddServer(NewKubeProxy())
+
+	//Federation servers
+	hk.AddServer(NewFederationAPIServer())
+	hk.AddServer(NewFederationCMServer())
 
 	hk.RunToExit(os.Args)
 }

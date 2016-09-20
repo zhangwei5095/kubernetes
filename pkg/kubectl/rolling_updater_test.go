@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,78 +26,33 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/testclient"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/api/testapi"
+	apitesting "k8s.io/kubernetes/pkg/api/testing"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	testcore "k8s.io/kubernetes/pkg/client/testing/core"
+	manualfake "k8s.io/kubernetes/pkg/client/unversioned/fake"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/intstr"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
 
-type updaterFake struct {
-	*testclient.Fake
-	ctrl client.ReplicationControllerInterface
-}
-
-func (c *updaterFake) ReplicationControllers(namespace string) client.ReplicationControllerInterface {
-	return c.ctrl
-}
-
-func fakeClientFor(namespace string, responses []fakeResponse) client.Interface {
-	fake := testclient.Fake{}
-	return &updaterFake{
-		&fake,
-		&fakeRc{
-			&testclient.FakeReplicationControllers{
-				Fake:      &fake,
-				Namespace: namespace,
-			},
-			responses,
-		},
-	}
-}
-
-type fakeResponse struct {
-	controller *api.ReplicationController
-	err        error
-}
-
-type fakeRc struct {
-	*testclient.FakeReplicationControllers
-	responses []fakeResponse
-}
-
-func (c *fakeRc) Get(name string) (*api.ReplicationController, error) {
-	action := testclient.FakeAction{Action: "get-controller", Value: name}
-	if len(c.responses) == 0 {
-		return nil, fmt.Errorf("Unexpected Action: %s", action)
-	}
-	c.Fake.Actions = append(c.Fake.Actions, action)
-	result := c.responses[0]
-	c.responses = c.responses[1:]
-	return result.controller, result.err
-}
-
-func (c *fakeRc) Create(controller *api.ReplicationController) (*api.ReplicationController, error) {
-	c.Fake.Actions = append(c.Fake.Actions, testclient.FakeAction{Action: "create-controller", Value: controller.ObjectMeta.Name})
-	return controller, nil
-}
-
-func (c *fakeRc) Update(controller *api.ReplicationController) (*api.ReplicationController, error) {
-	c.Fake.Actions = append(c.Fake.Actions, testclient.FakeAction{Action: "update-controller", Value: controller.ObjectMeta.Name})
-	return controller, nil
-}
-
-func oldRc(replicas int) *api.ReplicationController {
+func oldRc(replicas int, original int) *api.ReplicationController {
 	return &api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
-			Name: "foo-v1",
-			UID:  "7764ae47-9092-11e4-8393-42010af018ff",
+			Namespace: api.NamespaceDefault,
+			Name:      "foo-v1",
+			UID:       "7764ae47-9092-11e4-8393-42010af018ff",
+			Annotations: map[string]string{
+				originalReplicasAnnotation: fmt.Sprintf("%d", original),
+			},
 		},
 		Spec: api.ReplicationControllerSpec{
-			Replicas: replicas,
+			Replicas: int32(replicas),
 			Selector: map[string]string{"version": "v1"},
 			Template: &api.PodTemplateSpec{
 				ObjectMeta: api.ObjectMeta{
@@ -107,13 +62,13 @@ func oldRc(replicas int) *api.ReplicationController {
 			},
 		},
 		Status: api.ReplicationControllerStatus{
-			Replicas: replicas,
+			Replicas: int32(replicas),
 		},
 	}
 }
 
 func newRc(replicas int, desired int) *api.ReplicationController {
-	rc := oldRc(replicas)
+	rc := oldRc(replicas, replicas)
 	rc.Spec.Template = &api.PodTemplateSpec{
 		ObjectMeta: api.ObjectMeta{
 			Name:   "foo-v2",
@@ -122,7 +77,8 @@ func newRc(replicas int, desired int) *api.ReplicationController {
 	}
 	rc.Spec.Selector = map[string]string{"version": "v2"}
 	rc.ObjectMeta = api.ObjectMeta{
-		Name: "foo-v2",
+		Namespace: api.NamespaceDefault,
+		Name:      "foo-v2",
 		Annotations: map[string]string{
 			desiredReplicasAnnotation: fmt.Sprintf("%d", desired),
 			sourceIdAnnotation:        "foo-v1:7764ae47-9092-11e4-8393-42010af018ff",
@@ -131,166 +87,759 @@ func newRc(replicas int, desired int) *api.ReplicationController {
 	return rc
 }
 
+// TestUpdate performs complex scenario testing for rolling updates. It
+// provides fine grained control over the states for each update interval to
+// allow the expression of as many edge cases as possible.
 func TestUpdate(t *testing.T) {
+	// up represents a simulated scale up event and expectation
+	type up struct {
+		// to is the expected replica count for a scale-up
+		to int
+	}
+	// down represents a simulated scale down event and expectation
+	type down struct {
+		// oldReady is the number of oldRc replicas which will be seen
+		// as ready during the scale down attempt
+		oldReady int
+		// newReady is the number of newRc replicas which will be seen
+		// as ready during the scale up attempt
+		newReady int
+		// to is the expected replica count for the scale down
+		to int
+		// noop and to are mutually exclusive; if noop is true, that means for
+		// this down event, no scaling attempt should be made (for example, if
+		// by scaling down, the readiness minimum would be crossed.)
+		noop bool
+	}
+
 	tests := []struct {
-		oldRc, newRc *api.ReplicationController
-		responses    []fakeResponse
-		output       string
+		name string
+		// oldRc is the "from" deployment
+		oldRc *api.ReplicationController
+		// newRc is the "to" deployment
+		newRc *api.ReplicationController
+		// whether newRc existed (false means it was created)
+		newRcExists bool
+		maxUnavail  intstr.IntOrString
+		maxSurge    intstr.IntOrString
+		// expected is the sequence of up/down events that will be simulated and
+		// verified
+		expected []interface{}
+		// output is the expected textual output written
+		output string
 	}{
 		{
-			oldRc(1), newRc(1, 1),
-			[]fakeResponse{
-				// no existing newRc
-				{nil, fmt.Errorf("not found")},
-				// 4 gets for each scale
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				//				{oldRc(0), nil},
-				// cleanup annotations
-				{newRc(1, 1), nil},
-				{newRc(1, 1), nil},
+			name:        "10->10 30/0 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("30%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 10, newReady: 0, to: 7},
+				up{3},
+				down{oldReady: 7, newReady: 3, to: 4},
+				up{6},
+				down{oldReady: 4, newReady: 6, to: 1},
+				up{9},
+				down{oldReady: 1, newReady: 9, to: 0},
+				up{10},
 			},
-			`Creating foo-v2
-Updating foo-v1 replicas: 0, foo-v2 replicas: 1
-Update succeeded. Deleting foo-v1
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 7 pods available, don't exceed 10 pods)
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 9
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 10
+`,
+		},
+		{
+			name:        "10->10 30/0 delayed readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("30%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 10, newReady: 0, to: 7},
+				up{3},
+				down{oldReady: 7, newReady: 0, noop: true},
+				down{oldReady: 7, newReady: 1, to: 6},
+				up{4},
+				down{oldReady: 6, newReady: 4, to: 3},
+				up{7},
+				down{oldReady: 3, newReady: 7, to: 0},
+				up{10},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 7 pods available, don't exceed 10 pods)
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 6
+Scaling foo-v2 up to 4
+Scaling foo-v1 down to 3
+Scaling foo-v2 up to 7
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 10
 `,
 		}, {
-			oldRc(2), newRc(2, 2),
-			[]fakeResponse{
-				// no existing newRc
-				{nil, fmt.Errorf("not found")},
-				// 4 gets for each scale
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{oldRc(1), nil},
-				{oldRc(1), nil},
-				{oldRc(1), nil},
-				//				{oldRc(1), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				//				{oldRc(0), nil},
-				// cleanup annotations
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
+			name:        "10->10 30/0 fast readiness, continuation",
+			oldRc:       oldRc(7, 10),
+			newRc:       newRc(3, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("30%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 7, newReady: 3, to: 4},
+				up{6},
+				down{oldReady: 4, newReady: 6, to: 1},
+				up{9},
+				down{oldReady: 1, newReady: 9, to: 0},
+				up{10},
 			},
-			`Creating foo-v2
-Updating foo-v1 replicas: 1, foo-v2 replicas: 1
-Updating foo-v1 replicas: 0, foo-v2 replicas: 2
-Update succeeded. Deleting foo-v1
+			output: `Created foo-v2
+Scaling up foo-v2 from 3 to 10, scaling down foo-v1 from 7 to 0 (keep 7 pods available, don't exceed 10 pods)
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 9
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 10
 `,
 		}, {
-			oldRc(2), newRc(7, 7),
-			[]fakeResponse{
-				// no existing newRc
-				{nil, fmt.Errorf("not found")},
-				// 4 gets for each scale
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{oldRc(1), nil},
-				{oldRc(1), nil},
-				{oldRc(1), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				// final scale on newRc
-				{newRc(7, 7), nil},
-				{newRc(7, 7), nil},
-				{newRc(7, 7), nil},
-				{newRc(7, 7), nil},
-				// cleanup annotations
-				{newRc(7, 7), nil},
-				{newRc(7, 7), nil},
+			name:        "10->10 30/0 fast readiness, continued after restart which prevented first scale-up",
+			oldRc:       oldRc(7, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("30%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 7, newReady: 0, noop: true},
+				up{3},
+				down{oldReady: 7, newReady: 3, to: 4},
+				up{6},
+				down{oldReady: 4, newReady: 6, to: 1},
+				up{9},
+				down{oldReady: 1, newReady: 9, to: 0},
+				up{10},
 			},
-			`Creating foo-v2
-Updating foo-v1 replicas: 1, foo-v2 replicas: 1
-Updating foo-v1 replicas: 0, foo-v2 replicas: 2
-Scaling foo-v2 replicas: 2 -> 7
-Update succeeded. Deleting foo-v1
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 7 to 0 (keep 7 pods available, don't exceed 10 pods)
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 9
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 10
 `,
 		}, {
-			oldRc(7), newRc(2, 2),
-			[]fakeResponse{
-				// no existing newRc
-				{nil, fmt.Errorf("not found")},
-				// 4 gets for each update
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{newRc(1, 2), nil},
-				{oldRc(6), nil},
-				{oldRc(6), nil},
-				{oldRc(6), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
-				{oldRc(5), nil},
-				{oldRc(5), nil},
-				{oldRc(5), nil},
-				// stop oldRc
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				{oldRc(0), nil},
-				// cleanup annotations
-				{newRc(2, 2), nil},
-				{newRc(2, 2), nil},
+			name:        "10->10 0/30 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("30%"),
+			expected: []interface{}{
+				up{3},
+				down{oldReady: 10, newReady: 3, to: 7},
+				up{6},
+				down{oldReady: 7, newReady: 6, to: 4},
+				up{9},
+				down{oldReady: 4, newReady: 9, to: 1},
+				up{10},
+				down{oldReady: 1, newReady: 10, to: 0},
 			},
-			`Creating foo-v2
-Updating foo-v1 replicas: 6, foo-v2 replicas: 1
-Updating foo-v1 replicas: 5, foo-v2 replicas: 2
-Stopping foo-v1 replicas: 5 -> 0
-Update succeeded. Deleting foo-v1
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 10 pods available, don't exceed 13 pods)
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 9
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 0/30 delayed readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("30%"),
+			expected: []interface{}{
+				up{3},
+				down{oldReady: 10, newReady: 0, noop: true},
+				down{oldReady: 10, newReady: 1, to: 9},
+				up{4},
+				down{oldReady: 9, newReady: 3, to: 7},
+				up{6},
+				down{oldReady: 7, newReady: 6, to: 4},
+				up{9},
+				down{oldReady: 4, newReady: 9, to: 1},
+				up{10},
+				down{oldReady: 1, newReady: 9, noop: true},
+				down{oldReady: 1, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 10 pods available, don't exceed 13 pods)
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 9
+Scaling foo-v2 up to 4
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 9
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 10/20 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("20%"),
+			expected: []interface{}{
+				up{2},
+				down{oldReady: 10, newReady: 2, to: 7},
+				up{5},
+				down{oldReady: 7, newReady: 5, to: 4},
+				up{8},
+				down{oldReady: 4, newReady: 8, to: 1},
+				up{10},
+				down{oldReady: 1, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 9 pods available, don't exceed 12 pods)
+Scaling foo-v2 up to 2
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 5
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 8
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 10/20 delayed readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("20%"),
+			expected: []interface{}{
+				up{2},
+				down{oldReady: 10, newReady: 2, to: 7},
+				up{5},
+				down{oldReady: 7, newReady: 4, to: 5},
+				up{7},
+				down{oldReady: 5, newReady: 4, noop: true},
+				down{oldReady: 5, newReady: 7, to: 2},
+				up{10},
+				down{oldReady: 2, newReady: 9, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 9 pods available, don't exceed 12 pods)
+Scaling foo-v2 up to 2
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 5
+Scaling foo-v1 down to 5
+Scaling foo-v2 up to 7
+Scaling foo-v1 down to 2
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 10/20 fast readiness continued after restart which prevented first scale-down",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(2, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("20%"),
+			expected: []interface{}{
+				down{oldReady: 10, newReady: 2, to: 7},
+				up{5},
+				down{oldReady: 7, newReady: 5, to: 4},
+				up{8},
+				down{oldReady: 4, newReady: 8, to: 1},
+				up{10},
+				down{oldReady: 1, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 2 to 10, scaling down foo-v1 from 10 to 0 (keep 9 pods available, don't exceed 12 pods)
+Scaling foo-v1 down to 7
+Scaling foo-v2 up to 5
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 8
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 0/100 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("100%"),
+			expected: []interface{}{
+				up{10},
+				down{oldReady: 10, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 10 pods available, don't exceed 20 pods)
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 0/100 delayed readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("100%"),
+			expected: []interface{}{
+				up{10},
+				down{oldReady: 10, newReady: 0, noop: true},
+				down{oldReady: 10, newReady: 2, to: 8},
+				down{oldReady: 8, newReady: 7, to: 3},
+				down{oldReady: 3, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 10 pods available, don't exceed 20 pods)
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 8
+Scaling foo-v1 down to 3
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 100/0 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("100%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 10, newReady: 0, to: 0},
+				up{10},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 10, scaling down foo-v1 from 10 to 0 (keep 0 pods available, don't exceed 10 pods)
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 10
+`,
+		}, {
+			name:        "1->1 25/25 maintain minimum availability",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(0, 1),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("25%"),
+			maxSurge:    intstr.FromString("25%"),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 1, newReady: 0, noop: true},
+				down{oldReady: 1, newReady: 1, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 1, scaling down foo-v1 from 1 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "1->1 0/10 delayed readiness",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(0, 1),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("10%"),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 1, newReady: 0, noop: true},
+				down{oldReady: 1, newReady: 1, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 1, scaling down foo-v1 from 1 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "1->1 10/10 delayed readiness",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(0, 1),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("10%"),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 1, newReady: 0, noop: true},
+				down{oldReady: 1, newReady: 1, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 1, scaling down foo-v1 from 1 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "3->3 1/1 fast readiness (absolute values)",
+			oldRc:       oldRc(3, 3),
+			newRc:       newRc(0, 3),
+			newRcExists: false,
+			maxUnavail:  intstr.FromInt(0),
+			maxSurge:    intstr.FromInt(1),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 3, newReady: 1, to: 2},
+				up{2},
+				down{oldReady: 2, newReady: 2, to: 1},
+				up{3},
+				down{oldReady: 1, newReady: 3, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 3, scaling down foo-v1 from 3 to 0 (keep 3 pods available, don't exceed 4 pods)
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 2
+Scaling foo-v2 up to 2
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 3
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->10 0/20 fast readiness, continued after restart which resulted in partial first scale-up",
+			oldRc:       oldRc(6, 10),
+			newRc:       newRc(5, 10),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("20%"),
+			expected: []interface{}{
+				up{6},
+				down{oldReady: 6, newReady: 6, to: 4},
+				up{8},
+				down{oldReady: 4, newReady: 8, to: 2},
+				up{10},
+				down{oldReady: 1, newReady: 10, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 5 to 10, scaling down foo-v1 from 6 to 0 (keep 10 pods available, don't exceed 12 pods)
+Scaling foo-v2 up to 6
+Scaling foo-v1 down to 4
+Scaling foo-v2 up to 8
+Scaling foo-v1 down to 2
+Scaling foo-v2 up to 10
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "10->20 0/300 fast readiness",
+			oldRc:       oldRc(10, 10),
+			newRc:       newRc(0, 20),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("0%"),
+			maxSurge:    intstr.FromString("300%"),
+			expected: []interface{}{
+				up{20},
+				down{oldReady: 10, newReady: 20, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 20, scaling down foo-v1 from 10 to 0 (keep 20 pods available, don't exceed 80 pods)
+Scaling foo-v2 up to 20
+Scaling foo-v1 down to 0
+`,
+		}, {
+			name:        "1->1 0/1 scale down unavailable rc to a ready rc (rollback)",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(1, 1),
+			newRcExists: true,
+			maxUnavail:  intstr.FromInt(0),
+			maxSurge:    intstr.FromInt(1),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 0, newReady: 1, to: 0},
+			},
+			output: `Continuing update with existing controller foo-v2.
+Scaling up foo-v2 from 1 to 1, scaling down foo-v1 from 1 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "3->0 1/1 desired 0 (absolute values)",
+			oldRc:       oldRc(3, 3),
+			newRc:       newRc(0, 0),
+			newRcExists: true,
+			maxUnavail:  intstr.FromInt(1),
+			maxSurge:    intstr.FromInt(1),
+			expected: []interface{}{
+				down{oldReady: 3, newReady: 0, to: 0},
+			},
+			output: `Continuing update with existing controller foo-v2.
+Scaling up foo-v2 from 0 to 0, scaling down foo-v1 from 3 to 0 (keep 0 pods available, don't exceed 1 pods)
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "3->0 10/10 desired 0 (percentages)",
+			oldRc:       oldRc(3, 3),
+			newRc:       newRc(0, 0),
+			newRcExists: true,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("10%"),
+			expected: []interface{}{
+				down{oldReady: 3, newReady: 0, to: 0},
+			},
+			output: `Continuing update with existing controller foo-v2.
+Scaling up foo-v2 from 0 to 0, scaling down foo-v1 from 3 to 0 (keep 0 pods available, don't exceed 0 pods)
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "3->0 10/10 desired 0 (create new RC)",
+			oldRc:       oldRc(3, 3),
+			newRc:       newRc(0, 0),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("10%"),
+			maxSurge:    intstr.FromString("10%"),
+			expected: []interface{}{
+				down{oldReady: 3, newReady: 0, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 0, scaling down foo-v1 from 3 to 0 (keep 0 pods available, don't exceed 0 pods)
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "0->0 1/1 desired 0 (absolute values)",
+			oldRc:       oldRc(0, 0),
+			newRc:       newRc(0, 0),
+			newRcExists: true,
+			maxUnavail:  intstr.FromInt(1),
+			maxSurge:    intstr.FromInt(1),
+			expected: []interface{}{
+				down{oldReady: 0, newReady: 0, to: 0},
+			},
+			output: `Continuing update with existing controller foo-v2.
+Scaling up foo-v2 from 0 to 0, scaling down foo-v1 from 0 to 0 (keep 0 pods available, don't exceed 1 pods)
+`,
+		}, {
+			name:        "30->2 50%/0",
+			oldRc:       oldRc(30, 30),
+			newRc:       newRc(0, 2),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("50%"),
+			maxSurge:    intstr.FromInt(0),
+			expected: []interface{}{
+				down{oldReady: 30, newReady: 0, to: 1},
+				up{1},
+				down{oldReady: 1, newReady: 2, to: 0},
+				up{2},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 2, scaling down foo-v1 from 30 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 2
+`,
+		},
+		{
+			name:        "2->2 1/0 blocked oldRc",
+			oldRc:       oldRc(2, 2),
+			newRc:       newRc(0, 2),
+			newRcExists: false,
+			maxUnavail:  intstr.FromInt(1),
+			maxSurge:    intstr.FromInt(0),
+			expected: []interface{}{
+				down{oldReady: 1, newReady: 0, to: 1},
+				up{1},
+				down{oldReady: 1, newReady: 1, to: 0},
+				up{2},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 2, scaling down foo-v1 from 2 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 2
+`,
+		},
+		{
+			name:        "1->1 1/0 allow maxUnavailability",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(0, 1),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("1%"),
+			maxSurge:    intstr.FromInt(0),
+			expected: []interface{}{
+				down{oldReady: 1, newReady: 0, to: 0},
+				up{1},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 1, scaling down foo-v1 from 1 to 0 (keep 0 pods available, don't exceed 1 pods)
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 1
+`,
+		},
+		{
+			name:        "1->2 25/25 complex asymmetric deployment",
+			oldRc:       oldRc(1, 1),
+			newRc:       newRc(0, 2),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("25%"),
+			maxSurge:    intstr.FromString("25%"),
+			expected: []interface{}{
+				up{2},
+				down{oldReady: 1, newReady: 2, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 2, scaling down foo-v1 from 1 to 0 (keep 2 pods available, don't exceed 3 pods)
+Scaling foo-v2 up to 2
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "2->2 25/1 maxSurge trumps maxUnavailable",
+			oldRc:       oldRc(2, 2),
+			newRc:       newRc(0, 2),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("25%"),
+			maxSurge:    intstr.FromString("1%"),
+			expected: []interface{}{
+				up{1},
+				down{oldReady: 2, newReady: 1, to: 1},
+				up{2},
+				down{oldReady: 1, newReady: 2, to: 0},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 2, scaling down foo-v1 from 2 to 0 (keep 2 pods available, don't exceed 3 pods)
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 2
+Scaling foo-v1 down to 0
+`,
+		},
+		{
+			name:        "2->2 25/0 maxUnavailable resolves to zero, then one",
+			oldRc:       oldRc(2, 2),
+			newRc:       newRc(0, 2),
+			newRcExists: false,
+			maxUnavail:  intstr.FromString("25%"),
+			maxSurge:    intstr.FromString("0%"),
+			expected: []interface{}{
+				down{oldReady: 2, newReady: 0, to: 1},
+				up{1},
+				down{oldReady: 1, newReady: 1, to: 0},
+				up{2},
+			},
+			output: `Created foo-v2
+Scaling up foo-v2 from 0 to 2, scaling down foo-v1 from 2 to 0 (keep 1 pods available, don't exceed 2 pods)
+Scaling foo-v1 down to 1
+Scaling foo-v2 up to 1
+Scaling foo-v1 down to 0
+Scaling foo-v2 up to 2
 `,
 		},
 	}
 
-	for _, test := range tests {
-		updater := RollingUpdater{
-			NewRollingUpdaterClient(fakeClientFor("default", test.responses)),
-			"default",
+	for i, test := range tests {
+		// Extract expectations into some makeshift FIFOs so they can be returned
+		// in the correct order from the right places. This lets scale downs be
+		// expressed a single event even though the data is used from multiple
+		// interface calls.
+		oldReady := []int{}
+		newReady := []int{}
+		upTo := []int{}
+		downTo := []int{}
+		for _, event := range test.expected {
+			switch e := event.(type) {
+			case down:
+				oldReady = append(oldReady, e.oldReady)
+				newReady = append(newReady, e.newReady)
+				if !e.noop {
+					downTo = append(downTo, e.to)
+				}
+			case up:
+				upTo = append(upTo, e.to)
+			}
+		}
+
+		// Make a way to get the next item from our FIFOs. Returns -1 if the array
+		// is empty.
+		next := func(s *[]int) int {
+			slice := *s
+			v := -1
+			if len(slice) > 0 {
+				v = slice[0]
+				if len(slice) > 1 {
+					*s = slice[1:]
+				} else {
+					*s = []int{}
+				}
+			}
+			return v
+		}
+		t.Logf("running test %d (%s) (up: %v, down: %v, oldReady: %v, newReady: %v)", i, test.name, upTo, downTo, oldReady, newReady)
+		updater := &RollingUpdater{
+			ns: "default",
+			scaleAndWait: func(rc *api.ReplicationController, retry *RetryParams, wait *RetryParams) (*api.ReplicationController, error) {
+				// Return a scale up or scale down expectation depending on the rc,
+				// and throw errors if there is no expectation expressed for this
+				// call.
+				expected := -1
+				switch {
+				case rc == test.newRc:
+					t.Logf("scaling up %s to %d", rc.Name, rc.Spec.Replicas)
+					expected = next(&upTo)
+				case rc == test.oldRc:
+					t.Logf("scaling down %s to %d", rc.Name, rc.Spec.Replicas)
+					expected = next(&downTo)
+				}
+				if expected == -1 {
+					t.Fatalf("unexpected scale of %s to %d", rc.Name, rc.Spec.Replicas)
+				} else if e, a := expected, int(rc.Spec.Replicas); e != a {
+					t.Fatalf("expected scale of %s to %d, got %d", rc.Name, e, a)
+				}
+				// Simulate the scale.
+				rc.Status.Replicas = rc.Spec.Replicas
+				return rc, nil
+			},
+			getOrCreateTargetController: func(controller *api.ReplicationController, sourceId string) (*api.ReplicationController, bool, error) {
+				// Simulate a create vs. update of an existing controller.
+				return test.newRc, test.newRcExists, nil
+			},
+			cleanup: func(oldRc, newRc *api.ReplicationController, config *RollingUpdaterConfig) error {
+				return nil
+			},
+		}
+		// Set up a mock readiness check which handles the test assertions.
+		updater.getReadyPods = func(oldRc, newRc *api.ReplicationController, minReadySecondsDeadline int32) (int32, int32, error) {
+			// Return simulated readiness, and throw an error if this call has no
+			// expectations defined.
+			oldReady := next(&oldReady)
+			newReady := next(&newReady)
+			if oldReady == -1 || newReady == -1 {
+				t.Fatalf("unexpected getReadyPods call for:\noldRc: %#v\nnewRc: %#v", oldRc, newRc)
+			}
+			return int32(oldReady), int32(newReady), nil
 		}
 		var buffer bytes.Buffer
 		config := &RollingUpdaterConfig{
-			Out:           &buffer,
-			OldRc:         test.oldRc,
-			NewRc:         test.newRc,
-			UpdatePeriod:  0,
-			Interval:      time.Millisecond,
-			Timeout:       time.Millisecond,
-			CleanupPolicy: DeleteRollingUpdateCleanupPolicy,
+			Out:            &buffer,
+			OldRc:          test.oldRc,
+			NewRc:          test.newRc,
+			UpdatePeriod:   0,
+			Interval:       time.Millisecond,
+			Timeout:        time.Millisecond,
+			CleanupPolicy:  DeleteRollingUpdateCleanupPolicy,
+			MaxUnavailable: test.maxUnavail,
+			MaxSurge:       test.maxSurge,
 		}
-		if err := updater.Update(config); err != nil {
-			t.Errorf("Update failed: %v", err)
+		err := updater.Update(config)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
 		}
 		if buffer.String() != test.output {
 			t.Errorf("Bad output. expected:\n%s\ngot:\n%s", test.output, buffer.String())
@@ -298,157 +847,380 @@ Update succeeded. Deleting foo-v1
 	}
 }
 
-func PTestUpdateRecovery(t *testing.T) {
-	// Test recovery from interruption
-	rc := oldRc(2)
-	rcExisting := newRc(1, 3)
-
-	output := `Continuing update with existing controller foo-v2.
-Updating foo-v1 replicas: 1, foo-v2 replicas: 2
-Updating foo-v1 replicas: 0, foo-v2 replicas: 3
-Update succeeded. Deleting foo-v1
-`
-	responses := []fakeResponse{
-		// Existing newRc
-		{rcExisting, nil},
-		// 3 gets for each scale
-		{newRc(2, 2), nil},
-		{newRc(2, 2), nil},
-		{newRc(2, 2), nil},
-		{oldRc(1), nil},
-		{oldRc(1), nil},
-		{oldRc(1), nil},
-		{newRc(3, 3), nil},
-		{newRc(3, 3), nil},
-		{newRc(3, 3), nil},
-		{oldRc(0), nil},
-		{oldRc(0), nil},
-		{oldRc(0), nil},
-		// cleanup annotations
-		{newRc(3, 3), nil},
-		{newRc(3, 3), nil},
+// TestUpdate_progressTimeout ensures that an update which isn't making any
+// progress will eventually time out with a specified error.
+func TestUpdate_progressTimeout(t *testing.T) {
+	oldRc := oldRc(2, 2)
+	newRc := newRc(0, 2)
+	updater := &RollingUpdater{
+		ns: "default",
+		scaleAndWait: func(rc *api.ReplicationController, retry *RetryParams, wait *RetryParams) (*api.ReplicationController, error) {
+			// Do nothing.
+			return rc, nil
+		},
+		getOrCreateTargetController: func(controller *api.ReplicationController, sourceId string) (*api.ReplicationController, bool, error) {
+			return newRc, false, nil
+		},
+		cleanup: func(oldRc, newRc *api.ReplicationController, config *RollingUpdaterConfig) error {
+			return nil
+		},
 	}
-	updater := RollingUpdater{NewRollingUpdaterClient(fakeClientFor("default", responses)), "default"}
-
+	updater.getReadyPods = func(oldRc, newRc *api.ReplicationController, minReadySeconds int32) (int32, int32, error) {
+		// Coerce a timeout by pods never becoming ready.
+		return 0, 0, nil
+	}
 	var buffer bytes.Buffer
 	config := &RollingUpdaterConfig{
-		Out:           &buffer,
-		OldRc:         rc,
-		NewRc:         rcExisting,
-		UpdatePeriod:  0,
-		Interval:      time.Millisecond,
-		Timeout:       time.Millisecond,
-		CleanupPolicy: DeleteRollingUpdateCleanupPolicy,
+		Out:            &buffer,
+		OldRc:          oldRc,
+		NewRc:          newRc,
+		UpdatePeriod:   0,
+		Interval:       time.Millisecond,
+		Timeout:        time.Millisecond,
+		CleanupPolicy:  DeleteRollingUpdateCleanupPolicy,
+		MaxUnavailable: intstr.FromInt(0),
+		MaxSurge:       intstr.FromInt(1),
 	}
-	if err := updater.Update(config); err != nil {
-		t.Errorf("Update failed: %v", err)
+	err := updater.Update(config)
+	if err == nil {
+		t.Fatalf("expected an error")
 	}
-	if buffer.String() != output {
-		t.Errorf("Output was not as expected. Expected:\n%s\nGot:\n%s", output, buffer.String())
+	if e, a := "timed out waiting for any update progress to be made", err.Error(); e != a {
+		t.Fatalf("expected error message: %s, got: %s", e, a)
 	}
 }
 
-// TestRollingUpdater_preserveCleanup ensures that the old controller isn't
-// deleted following a successful deployment.
-func TestRollingUpdater_preserveCleanup(t *testing.T) {
-	rc := oldRc(2)
-	rcExisting := newRc(1, 3)
-
+func TestUpdate_assignOriginalAnnotation(t *testing.T) {
+	oldRc := oldRc(1, 1)
+	delete(oldRc.Annotations, originalReplicasAnnotation)
+	newRc := newRc(1, 1)
+	fake := fake.NewSimpleClientset(oldRc)
 	updater := &RollingUpdater{
-		ns: "default",
-		c: &rollingUpdaterClientImpl{
-			GetReplicationControllerFn: func(namespace, name string) (*api.ReplicationController, error) {
-				switch name {
-				case rc.Name:
-					return rc, nil
-				case rcExisting.Name:
-					return rcExisting, nil
-				default:
-					return nil, fmt.Errorf("unexpected get call for %s/%s", namespace, name)
-				}
-			},
-			UpdateReplicationControllerFn: func(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error) {
-				return rc, nil
-			},
-			CreateReplicationControllerFn: func(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error) {
-				t.Fatalf("unexpected call to create %s/rc:%#v", namespace, rc)
-				return nil, nil
-			},
-			DeleteReplicationControllerFn: func(namespace, name string) error {
-				t.Fatalf("unexpected call to delete %s/%s", namespace, name)
-				return nil
-			},
-			ControllerHasDesiredReplicasFn: func(rc *api.ReplicationController) wait.ConditionFunc {
-				return func() (done bool, err error) {
-					return true, nil
-				}
-			},
+		rcClient:  fake.Core(),
+		podClient: fake.Core(),
+		ns:        "default",
+		scaleAndWait: func(rc *api.ReplicationController, retry *RetryParams, wait *RetryParams) (*api.ReplicationController, error) {
+			return rc, nil
+		},
+		getOrCreateTargetController: func(controller *api.ReplicationController, sourceId string) (*api.ReplicationController, bool, error) {
+			return newRc, false, nil
+		},
+		cleanup: func(oldRc, newRc *api.ReplicationController, config *RollingUpdaterConfig) error {
+			return nil
+		},
+		getReadyPods: func(oldRc, newRc *api.ReplicationController, minReadySeconds int32) (int32, int32, error) {
+			return 1, 1, nil
 		},
 	}
-
+	var buffer bytes.Buffer
 	config := &RollingUpdaterConfig{
-		Out:           ioutil.Discard,
-		OldRc:         rc,
-		NewRc:         rcExisting,
-		UpdatePeriod:  0,
-		Interval:      time.Millisecond,
-		Timeout:       time.Millisecond,
-		CleanupPolicy: PreserveRollingUpdateCleanupPolicy,
+		Out:            &buffer,
+		OldRc:          oldRc,
+		NewRc:          newRc,
+		UpdatePeriod:   0,
+		Interval:       time.Millisecond,
+		Timeout:        time.Millisecond,
+		CleanupPolicy:  DeleteRollingUpdateCleanupPolicy,
+		MaxUnavailable: intstr.FromString("100%"),
 	}
 	err := updater.Update(config)
 	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
+	}
+	updateAction := fake.Actions()[1].(testcore.UpdateAction)
+	if updateAction.GetResource().GroupResource() != api.Resource("replicationcontrollers") {
+		t.Fatalf("expected rc to be updated: %#v", updateAction)
+	}
+	if e, a := "1", updateAction.GetObject().(*api.ReplicationController).Annotations[originalReplicasAnnotation]; e != a {
+		t.Fatalf("expected annotation value %s, got %s", e, a)
 	}
 }
 
-func TestRename(t *testing.T) {
+func TestRollingUpdater_multipleContainersInPod(t *testing.T) {
 	tests := []struct {
-		namespace   string
-		newName     string
-		oldName     string
-		err         error
-		expectError bool
+		oldRc *api.ReplicationController
+		newRc *api.ReplicationController
+
+		container     string
+		image         string
+		deploymentKey string
 	}{
 		{
-			namespace: "default",
-			newName:   "bar",
-			oldName:   "foo",
+			oldRc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
+				},
+				Spec: api.ReplicationControllerSpec{
+					Selector: map[string]string{
+						"dk": "old",
+					},
+					Template: &api.PodTemplateSpec{
+						ObjectMeta: api.ObjectMeta{
+							Labels: map[string]string{
+								"dk": "old",
+							},
+						},
+						Spec: api.PodSpec{
+							Containers: []api.Container{
+								{
+									Name:  "container1",
+									Image: "image1",
+								},
+								{
+									Name:  "container2",
+									Image: "image2",
+								},
+							},
+						},
+					},
+				},
+			},
+			newRc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
+				},
+				Spec: api.ReplicationControllerSpec{
+					Selector: map[string]string{
+						"dk": "old",
+					},
+					Template: &api.PodTemplateSpec{
+						ObjectMeta: api.ObjectMeta{
+							Labels: map[string]string{
+								"dk": "old",
+							},
+						},
+						Spec: api.PodSpec{
+							Containers: []api.Container{
+								{
+									Name:  "container1",
+									Image: "newimage",
+								},
+								{
+									Name:  "container2",
+									Image: "image2",
+								},
+							},
+						},
+					},
+				},
+			},
+			container:     "container1",
+			image:         "newimage",
+			deploymentKey: "dk",
 		},
 		{
-			namespace:   "default",
-			newName:     "bar",
-			oldName:     "foo",
-			err:         fmt.Errorf("Test Error"),
-			expectError: true,
+			oldRc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "bar",
+				},
+				Spec: api.ReplicationControllerSpec{
+					Selector: map[string]string{
+						"dk": "old",
+					},
+					Template: &api.PodTemplateSpec{
+						ObjectMeta: api.ObjectMeta{
+							Labels: map[string]string{
+								"dk": "old",
+							},
+						},
+						Spec: api.PodSpec{
+							Containers: []api.Container{
+								{
+									Name:  "container1",
+									Image: "image1",
+								},
+							},
+						},
+					},
+				},
+			},
+			newRc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "bar",
+				},
+				Spec: api.ReplicationControllerSpec{
+					Selector: map[string]string{
+						"dk": "old",
+					},
+					Template: &api.PodTemplateSpec{
+						ObjectMeta: api.ObjectMeta{
+							Labels: map[string]string{
+								"dk": "old",
+							},
+						},
+						Spec: api.PodSpec{
+							Containers: []api.Container{
+								{
+									Name:  "container1",
+									Image: "newimage",
+								},
+							},
+						},
+					},
+				},
+			},
+			container:     "container1",
+			image:         "newimage",
+			deploymentKey: "dk",
 		},
 	}
+
 	for _, test := range tests {
-		fakeClient := &rollingUpdaterClientImpl{
-			CreateReplicationControllerFn: func(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error) {
-				if namespace != test.namespace {
-					t.Errorf("unexepected namespace: %s, expected %s", namespace, test.namespace)
-				}
-				if rc.Name != test.newName {
-					t.Errorf("unexepected name: %s, expected %s", rc.Name, test.newName)
-				}
-				return rc, test.err
-			},
-			DeleteReplicationControllerFn: func(namespace, name string) error {
-				if namespace != test.namespace {
-					t.Errorf("unexepected namespace: %s, expected %s", namespace, test.namespace)
-				}
-				if name != test.oldName {
-					t.Errorf("unexepected name: %s, expected %s", name, test.oldName)
-				}
-				return nil
-			},
-		}
-		err := Rename(fakeClient, &api.ReplicationController{ObjectMeta: api.ObjectMeta{Namespace: test.namespace, Name: test.oldName}}, test.newName)
-		if err != nil && !test.expectError {
+		fake := fake.NewSimpleClientset(test.oldRc)
+
+		codec := testapi.Default.Codec()
+
+		deploymentHash, err := api.HashObject(test.newRc, codec)
+		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err == nil && test.expectError {
-			t.Errorf("unexpected non-error")
+
+		test.newRc.Spec.Selector[test.deploymentKey] = deploymentHash
+		test.newRc.Spec.Template.Labels[test.deploymentKey] = deploymentHash
+		test.newRc.Name = fmt.Sprintf("%s-%s", test.newRc.Name, deploymentHash)
+
+		config := &NewControllerConfig{
+			Namespace:     api.NamespaceDefault,
+			OldName:       test.oldRc.ObjectMeta.Name,
+			NewName:       test.newRc.ObjectMeta.Name,
+			Image:         test.image,
+			Container:     test.container,
+			DeploymentKey: test.deploymentKey,
+		}
+		updatedRc, err := CreateNewControllerFromCurrentController(fake.Core(), codec, config)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(updatedRc, test.newRc) {
+			t.Errorf("expected:\n%#v\ngot:\n%#v\n", test.newRc, updatedRc)
+		}
+	}
+}
+
+// TestRollingUpdater_cleanupWithClients ensures that the cleanup policy is
+// correctly implemented.
+func TestRollingUpdater_cleanupWithClients(t *testing.T) {
+	rc := oldRc(2, 2)
+	rcExisting := newRc(1, 3)
+
+	tests := []struct {
+		name      string
+		policy    RollingUpdaterCleanupPolicy
+		responses []runtime.Object
+		expected  []string
+	}{
+		{
+			name:      "preserve",
+			policy:    PreserveRollingUpdateCleanupPolicy,
+			responses: []runtime.Object{rcExisting},
+			expected: []string{
+				"get",
+				"update",
+				"get",
+				"get",
+			},
+		},
+		{
+			name:      "delete",
+			policy:    DeleteRollingUpdateCleanupPolicy,
+			responses: []runtime.Object{rcExisting},
+			expected: []string{
+				"get",
+				"update",
+				"get",
+				"get",
+				"delete",
+			},
+		},
+		//{
+		// This cases is separated to a standalone
+		// TestRollingUpdater_cleanupWithClients_Rename. We have to do this
+		// because the unversioned fake client is unable to delete objects.
+		// TODO: uncomment this case when the unversioned fake client uses
+		// pkg/client/testing/core.
+		//	{
+		//		name:      "rename",
+		//		policy:    RenameRollingUpdateCleanupPolicy,
+		//		responses: []runtime.Object{rcExisting},
+		//		expected: []string{
+		//			"get",
+		//			"update",
+		//			"get",
+		//			"get",
+		//			"delete",
+		//			"create",
+		//			"delete",
+		//		},
+		//	},
+		//},
+	}
+
+	for _, test := range tests {
+		objs := []runtime.Object{rc}
+		objs = append(objs, test.responses...)
+		fake := fake.NewSimpleClientset(objs...)
+		updater := &RollingUpdater{
+			ns:        "default",
+			rcClient:  fake.Core(),
+			podClient: fake.Core(),
+		}
+		config := &RollingUpdaterConfig{
+			Out:           ioutil.Discard,
+			OldRc:         rc,
+			NewRc:         rcExisting,
+			UpdatePeriod:  0,
+			Interval:      time.Millisecond,
+			Timeout:       time.Millisecond,
+			CleanupPolicy: test.policy,
+		}
+		err := updater.cleanupWithClients(rc, rcExisting, config)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if len(fake.Actions()) != len(test.expected) {
+			t.Fatalf("%s: unexpected actions: %v, expected %v", test.name, fake.Actions(), test.expected)
+		}
+		for j, action := range fake.Actions() {
+			if e, a := test.expected[j], action.GetVerb(); e != a {
+				t.Errorf("%s: unexpected action: expected %s, got %s", test.name, e, a)
+			}
+		}
+	}
+}
+
+// TestRollingUpdater_cleanupWithClients_Rename tests the rename cleanup policy. It's separated to
+// a standalone test because the unversioned fake client is unable to delete
+// objects.
+// TODO: move this test back to TestRollingUpdater_cleanupWithClients
+// when the fake client uses pkg/client/testing/core in the future.
+func TestRollingUpdater_cleanupWithClients_Rename(t *testing.T) {
+	rc := oldRc(2, 2)
+	rcExisting := newRc(1, 3)
+	expectedActions := []string{"delete", "get", "create"}
+	fake := fake.NewSimpleClientset()
+	fake.AddReactor("*", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
+		switch action.(type) {
+		case testcore.CreateAction:
+			return true, nil, nil
+		case testcore.GetAction:
+			return true, nil, errors.NewNotFound(unversioned.GroupResource{}, "")
+		case testcore.DeleteAction:
+			return true, nil, nil
+		}
+		return false, nil, nil
+	})
+
+	err := Rename(fake.Core(), rcExisting, rc.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for j, action := range fake.Actions() {
+		if e, a := expectedActions[j], action.GetVerb(); e != a {
+			t.Errorf("unexpected action: expected %s, got %s", e, a)
 		}
 	}
 }
@@ -456,7 +1228,8 @@ func TestRename(t *testing.T) {
 func TestFindSourceController(t *testing.T) {
 	ctrl1 := api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
-			Name: "foo",
+			Namespace: api.NamespaceDefault,
+			Name:      "foo",
 			Annotations: map[string]string{
 				sourceIdAnnotation: "bar:1234",
 			},
@@ -464,7 +1237,8 @@ func TestFindSourceController(t *testing.T) {
 	}
 	ctrl2 := api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
-			Name: "bar",
+			Namespace: api.NamespaceDefault,
+			Name:      "bar",
 			Annotations: map[string]string{
 				sourceIdAnnotation: "foo:12345",
 			},
@@ -472,6 +1246,8 @@ func TestFindSourceController(t *testing.T) {
 	}
 	ctrl3 := api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
+			Namespace: api.NamespaceDefault,
+			Name:      "baz",
 			Annotations: map[string]string{
 				sourceIdAnnotation: "baz:45667",
 			},
@@ -525,12 +1301,8 @@ func TestFindSourceController(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		fakeClient := rollingUpdaterClientImpl{
-			ListReplicationControllersFn: func(namespace string, selector labels.Selector) (*api.ReplicationControllerList, error) {
-				return test.list, test.err
-			},
-		}
-		ctrl, err := FindSourceController(&fakeClient, "default", test.name)
+		fakeClient := fake.NewSimpleClientset(test.list)
+		ctrl, err := FindSourceController(fakeClient.Core(), "default", test.name)
 		if test.expectError && err == nil {
 			t.Errorf("unexpected non-error")
 		}
@@ -555,6 +1327,10 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 	}{
 		{
 			rc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
+				},
 				Spec: api.ReplicationControllerSpec{
 					Template: &api.PodTemplateSpec{},
 				},
@@ -565,6 +1341,8 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 
 			expectedRc: &api.ReplicationController{
 				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
 					Annotations: map[string]string{
 						"kubectl.kubernetes.io/next-controller-id": "foo",
 					},
@@ -585,6 +1363,10 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 		},
 		{
 			rc: &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
+				},
 				Spec: api.ReplicationControllerSpec{
 					Template: &api.PodTemplateSpec{
 						ObjectMeta: api.ObjectMeta{
@@ -604,6 +1386,8 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 
 			expectedRc: &api.ReplicationController{
 				ObjectMeta: api.ObjectMeta{
+					Namespace: api.NamespaceDefault,
+					Name:      "foo",
 					Annotations: map[string]string{
 						"kubectl.kubernetes.io/next-controller-id": "foo",
 					},
@@ -625,8 +1409,8 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 	}
 	for _, test := range tests {
 		buffer := &bytes.Buffer{}
-		fakeClient := fakeClientFor("default", []fakeResponse{})
-		rc, err := UpdateExistingReplicationController(fakeClient, test.rc, "default", test.name, test.deploymentKey, test.deploymentValue, buffer)
+		fakeClient := fake.NewSimpleClientset(test.expectedRc)
+		rc, err := UpdateExistingReplicationController(fakeClient.Core(), fakeClient.Core(), test.rc, "default", test.name, test.deploymentKey, test.deploymentValue, buffer)
 		if !reflect.DeepEqual(rc, test.expectedRc) {
 			t.Errorf("expected:\n%#v\ngot:\n%#v\n", test.expectedRc, rc)
 		}
@@ -639,8 +1423,8 @@ func TestUpdateExistingReplicationController(t *testing.T) {
 	}
 }
 
-func TestUpdateWithRetries(t *testing.T) {
-	codec := testapi.Codec()
+func TestUpdateRcWithRetries(t *testing.T) {
+	codec := testapi.Default.Codec()
 	rc := &api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{Name: "rc",
 			Labels: map[string]string{
@@ -657,10 +1441,7 @@ func TestUpdateWithRetries(t *testing.T) {
 						"foo": "bar",
 					},
 				},
-				Spec: api.PodSpec{
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSClusterFirst,
-				},
+				Spec: apitesting.DeepEqualSafePodSpec(),
 			},
 		},
 	}
@@ -672,20 +1453,22 @@ func TestUpdateWithRetries(t *testing.T) {
 	newRc := *rc
 	newRc.ResourceVersion = "2"
 	newRc.Spec.Selector["baz"] = "foobar"
+	header := http.Header{}
+	header.Set("Content-Type", runtime.ContentTypeJSON)
 	updates := []*http.Response{
-		{StatusCode: 500, Body: objBody(codec, &api.ReplicationController{})},
-		{StatusCode: 500, Body: objBody(codec, &api.ReplicationController{})},
-		{StatusCode: 200, Body: objBody(codec, &newRc)},
+		{StatusCode: 409, Header: header, Body: objBody(codec, &api.ReplicationController{})}, // conflict
+		{StatusCode: 409, Header: header, Body: objBody(codec, &api.ReplicationController{})}, // conflict
+		{StatusCode: 200, Header: header, Body: objBody(codec, &newRc)},
 	}
 	gets := []*http.Response{
-		{StatusCode: 500, Body: objBody(codec, &api.ReplicationController{})},
-		{StatusCode: 200, Body: objBody(codec, rc)},
+		{StatusCode: 500, Header: header, Body: objBody(codec, &api.ReplicationController{})},
+		{StatusCode: 200, Header: header, Body: objBody(codec, rc)},
 	}
-	fakeClient := &client.FakeRESTClient{
-		Codec: codec,
-		Client: client.HTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+	fakeClient := &manualfake.RESTClient{
+		NegotiatedSerializer: testapi.Default.NegotiatedSerializer(),
+		Client: manualfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch p, m := req.URL.Path, req.Method; {
-			case p == testapi.ResourcePath("replicationcontrollers", "default", "rc") && m == "PUT":
+			case p == testapi.Default.ResourcePath("replicationcontrollers", "default", "rc") && m == "PUT":
 				update := updates[0]
 				updates = updates[1:]
 				// We should always get an update with a valid rc even when the get fails. The rc should always
@@ -698,7 +1481,7 @@ func TestUpdateWithRetries(t *testing.T) {
 					delete(c.Spec.Selector, "baz")
 				}
 				return update, nil
-			case p == testapi.ResourcePath("replicationcontrollers", "default", "rc") && m == "GET":
+			case p == testapi.Default.ResourcePath("replicationcontrollers", "default", "rc") && m == "GET":
 				get := gets[0]
 				gets = gets[1:]
 				return get, nil
@@ -708,12 +1491,13 @@ func TestUpdateWithRetries(t *testing.T) {
 			}
 		}),
 	}
-	clientConfig := &client.Config{Version: testapi.Version()}
-	client := client.NewOrDie(clientConfig)
-	client.Client = fakeClient.Client
+	clientConfig := &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: api.Codecs, GroupVersion: testapi.Default.GroupVersion()}}
+	restClient, _ := restclient.RESTClientFor(clientConfig)
+	restClient.Client = fakeClient.Client
+	clientset := internalclientset.New(restClient)
 
-	if rc, err := updateWithRetries(
-		client.ReplicationControllers("default"), rc, func(c *api.ReplicationController) {
+	if rc, err := updateRcWithRetries(
+		clientset, "default", rc, func(c *api.ReplicationController) {
 			c.Spec.Selector["baz"] = "foobar"
 		}); err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -721,7 +1505,7 @@ func TestUpdateWithRetries(t *testing.T) {
 		t.Errorf("Expected updated rc, got %+v", rc)
 	}
 	if len(updates) != 0 || len(gets) != 0 {
-		t.Errorf("Remaining updates %+v gets %+v", updates, gets)
+		t.Errorf("Remaining updates %#v gets %#v", updates, gets)
 	}
 }
 
@@ -731,7 +1515,7 @@ func readOrDie(t *testing.T, req *http.Request, codec runtime.Codec) runtime.Obj
 		t.Errorf("Error reading: %v", err)
 		t.FailNow()
 	}
-	obj, err := codec.Decode(data)
+	obj, err := runtime.Decode(codec, data)
 	if err != nil {
 		t.Errorf("error decoding: %v", err)
 		t.FailNow()
@@ -745,7 +1529,7 @@ func objBody(codec runtime.Codec, obj runtime.Object) io.ReadCloser {
 
 func TestAddDeploymentHash(t *testing.T) {
 	buf := &bytes.Buffer{}
-	codec := testapi.Codec()
+	codec := testapi.Default.Codec()
 	rc := &api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{Name: "rc"},
 		Spec: api.ReplicationControllerSpec{
@@ -770,46 +1554,49 @@ func TestAddDeploymentHash(t *testing.T) {
 		},
 	}
 
-	seen := util.StringSet{}
+	seen := sets.String{}
 	updatedRc := false
-	fakeClient := &client.FakeRESTClient{
-		Codec: codec,
-		Client: client.HTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+	fakeClient := &manualfake.RESTClient{
+		NegotiatedSerializer: testapi.Default.NegotiatedSerializer(),
+		Client: manualfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+			header := http.Header{}
+			header.Set("Content-Type", runtime.ContentTypeJSON)
 			switch p, m := req.URL.Path, req.Method; {
-			case p == testapi.ResourcePath("pods", "default", "") && m == "GET":
+			case p == testapi.Default.ResourcePath("pods", "default", "") && m == "GET":
 				if req.URL.RawQuery != "labelSelector=foo%3Dbar" {
 					t.Errorf("Unexpected query string: %s", req.URL.RawQuery)
 				}
-				return &http.Response{StatusCode: 200, Body: objBody(codec, podList)}, nil
-			case p == testapi.ResourcePath("pods", "default", "foo") && m == "PUT":
+				return &http.Response{StatusCode: 200, Header: header, Body: objBody(codec, podList)}, nil
+			case p == testapi.Default.ResourcePath("pods", "default", "foo") && m == "PUT":
 				seen.Insert("foo")
 				obj := readOrDie(t, req, codec)
 				podList.Items[0] = *(obj.(*api.Pod))
-				return &http.Response{StatusCode: 200, Body: objBody(codec, &podList.Items[0])}, nil
-			case p == testapi.ResourcePath("pods", "default", "bar") && m == "PUT":
+				return &http.Response{StatusCode: 200, Header: header, Body: objBody(codec, &podList.Items[0])}, nil
+			case p == testapi.Default.ResourcePath("pods", "default", "bar") && m == "PUT":
 				seen.Insert("bar")
 				obj := readOrDie(t, req, codec)
 				podList.Items[1] = *(obj.(*api.Pod))
-				return &http.Response{StatusCode: 200, Body: objBody(codec, &podList.Items[1])}, nil
-			case p == testapi.ResourcePath("pods", "default", "baz") && m == "PUT":
+				return &http.Response{StatusCode: 200, Header: header, Body: objBody(codec, &podList.Items[1])}, nil
+			case p == testapi.Default.ResourcePath("pods", "default", "baz") && m == "PUT":
 				seen.Insert("baz")
 				obj := readOrDie(t, req, codec)
 				podList.Items[2] = *(obj.(*api.Pod))
-				return &http.Response{StatusCode: 200, Body: objBody(codec, &podList.Items[2])}, nil
-			case p == testapi.ResourcePath("replicationcontrollers", "default", "rc") && m == "PUT":
+				return &http.Response{StatusCode: 200, Header: header, Body: objBody(codec, &podList.Items[2])}, nil
+			case p == testapi.Default.ResourcePath("replicationcontrollers", "default", "rc") && m == "PUT":
 				updatedRc = true
-				return &http.Response{StatusCode: 200, Body: objBody(codec, rc)}, nil
+				return &http.Response{StatusCode: 200, Header: header, Body: objBody(codec, rc)}, nil
 			default:
 				t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
 				return nil, nil
 			}
 		}),
 	}
-	clientConfig := &client.Config{Version: testapi.Version()}
-	client := client.NewOrDie(clientConfig)
-	client.Client = fakeClient.Client
+	clientConfig := &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: api.Codecs, GroupVersion: testapi.Default.GroupVersion()}}
+	restClient, _ := restclient.RESTClientFor(clientConfig)
+	restClient.Client = fakeClient.Client
+	clientset := internalclientset.New(restClient)
 
-	if _, err := AddDeploymentKeyToReplicationController(rc, client, "dk", "hash", api.NamespaceDefault, buf); err != nil {
+	if _, err := AddDeploymentKeyToReplicationController(rc, clientset.Core(), clientset.Core(), "dk", "hash", api.NamespaceDefault, buf); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	for _, pod := range podList.Items {
@@ -822,36 +1609,158 @@ func TestAddDeploymentHash(t *testing.T) {
 	}
 }
 
-// rollingUpdaterClientImpl is a dynamic RollingUpdaterClient.
-type rollingUpdaterClientImpl struct {
-	ListReplicationControllersFn   func(namespace string, selector labels.Selector) (*api.ReplicationControllerList, error)
-	GetReplicationControllerFn     func(namespace, name string) (*api.ReplicationController, error)
-	UpdateReplicationControllerFn  func(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error)
-	CreateReplicationControllerFn  func(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error)
-	DeleteReplicationControllerFn  func(namespace, name string) error
-	ControllerHasDesiredReplicasFn func(rc *api.ReplicationController) wait.ConditionFunc
-}
+func TestRollingUpdater_readyPods(t *testing.T) {
+	count := 0
+	now := unversioned.Date(2016, time.April, 1, 1, 0, 0, 0, time.UTC)
+	mkpod := func(owner *api.ReplicationController, ready bool, readyTime unversioned.Time) *api.Pod {
+		count = count + 1
+		labels := map[string]string{}
+		for k, v := range owner.Spec.Selector {
+			labels[k] = v
+		}
+		status := api.ConditionTrue
+		if !ready {
+			status = api.ConditionFalse
+		}
+		return &api.Pod{
+			ObjectMeta: api.ObjectMeta{
+				Namespace: api.NamespaceDefault,
+				Name:      fmt.Sprintf("pod-%d", count),
+				Labels:    labels,
+			},
+			Status: api.PodStatus{
+				Conditions: []api.PodCondition{
+					{
+						Type:               api.PodReady,
+						Status:             status,
+						LastTransitionTime: readyTime,
+					},
+				},
+			},
+		}
+	}
 
-func (c *rollingUpdaterClientImpl) ListReplicationControllers(namespace string, selector labels.Selector) (*api.ReplicationControllerList, error) {
-	return c.ListReplicationControllersFn(namespace, selector)
-}
+	tests := []struct {
+		oldRc *api.ReplicationController
+		newRc *api.ReplicationController
+		// expectated old/new ready counts
+		oldReady int32
+		newReady int32
+		// pods owned by the rcs; indicate whether they're ready
+		oldPods []bool
+		newPods []bool
+		// specify additional time to wait for deployment to wait on top of the
+		// pod ready time
+		minReadySeconds int32
+		podReadyTimeFn  func() unversioned.Time
+		nowFn           func() unversioned.Time
+	}{
+		{
+			oldRc:    oldRc(4, 4),
+			newRc:    newRc(4, 4),
+			oldReady: 4,
+			newReady: 2,
+			oldPods: []bool{
+				true,
+				true,
+				true,
+				true,
+			},
+			newPods: []bool{
+				true,
+				false,
+				true,
+				false,
+			},
+		},
+		{
+			oldRc:    oldRc(4, 4),
+			newRc:    newRc(4, 4),
+			oldReady: 0,
+			newReady: 1,
+			oldPods: []bool{
+				false,
+			},
+			newPods: []bool{
+				true,
+			},
+		},
+		{
+			oldRc:    oldRc(4, 4),
+			newRc:    newRc(4, 4),
+			oldReady: 1,
+			newReady: 0,
+			oldPods: []bool{
+				true,
+			},
+			newPods: []bool{
+				false,
+			},
+		},
+		{
+			oldRc:    oldRc(4, 4),
+			newRc:    newRc(4, 4),
+			oldReady: 0,
+			newReady: 0,
+			oldPods: []bool{
+				true,
+			},
+			newPods: []bool{
+				true,
+			},
+			minReadySeconds: 5,
+			nowFn:           func() unversioned.Time { return now },
+		},
+		{
+			oldRc:    oldRc(4, 4),
+			newRc:    newRc(4, 4),
+			oldReady: 1,
+			newReady: 1,
+			oldPods: []bool{
+				true,
+			},
+			newPods: []bool{
+				true,
+			},
+			minReadySeconds: 5,
+			nowFn:           func() unversioned.Time { return unversioned.Time{Time: now.Add(time.Duration(6 * time.Second))} },
+			podReadyTimeFn:  func() unversioned.Time { return now },
+		},
+	}
 
-func (c *rollingUpdaterClientImpl) GetReplicationController(namespace, name string) (*api.ReplicationController, error) {
-	return c.GetReplicationControllerFn(namespace, name)
-}
+	for i, test := range tests {
+		t.Logf("evaluating test %d", i)
+		if test.nowFn == nil {
+			test.nowFn = func() unversioned.Time { return now }
+		}
+		if test.podReadyTimeFn == nil {
+			test.podReadyTimeFn = test.nowFn
+		}
+		// Populate the fake client with pods associated with their owners.
+		pods := []runtime.Object{}
+		for _, ready := range test.oldPods {
+			pods = append(pods, mkpod(test.oldRc, ready, test.podReadyTimeFn()))
+		}
+		for _, ready := range test.newPods {
+			pods = append(pods, mkpod(test.newRc, ready, test.podReadyTimeFn()))
+		}
+		client := fake.NewSimpleClientset(pods...)
 
-func (c *rollingUpdaterClientImpl) UpdateReplicationController(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error) {
-	return c.UpdateReplicationControllerFn(namespace, rc)
-}
-
-func (c *rollingUpdaterClientImpl) CreateReplicationController(namespace string, rc *api.ReplicationController) (*api.ReplicationController, error) {
-	return c.CreateReplicationControllerFn(namespace, rc)
-}
-
-func (c *rollingUpdaterClientImpl) DeleteReplicationController(namespace, name string) error {
-	return c.DeleteReplicationControllerFn(namespace, name)
-}
-
-func (c *rollingUpdaterClientImpl) ControllerHasDesiredReplicas(rc *api.ReplicationController) wait.ConditionFunc {
-	return c.ControllerHasDesiredReplicasFn(rc)
+		updater := &RollingUpdater{
+			ns:        "default",
+			rcClient:  client.Core(),
+			podClient: client.Core(),
+			nowFn:     test.nowFn,
+		}
+		oldReady, newReady, err := updater.readyPods(test.oldRc, test.newRc, test.minReadySeconds)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if e, a := test.oldReady, oldReady; e != a {
+			t.Errorf("expected old ready %d, got %d", e, a)
+		}
+		if e, a := test.newReady, newReady; e != a {
+			t.Errorf("expected new ready %d, got %d", e, a)
+		}
+	}
 }

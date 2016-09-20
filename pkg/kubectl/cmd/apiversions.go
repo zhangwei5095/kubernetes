@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,15 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl"
-	cmdutil "github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 )
 
 func NewCmdApiVersions(f *cmdutil.Factory, out io.Writer) *cobra.Command {
@@ -31,7 +33,7 @@ func NewCmdApiVersions(f *cmdutil.Factory, out io.Writer) *cobra.Command {
 		Use: "api-versions",
 		// apiversions is deprecated.
 		Aliases: []string{"apiversions"},
-		Short:   "Print available API versions.",
+		Short:   "Print the supported API versions on the server, in the form of \"group/version\"",
 		Run: func(cmd *cobra.Command, args []string) {
 			err := RunApiVersions(f, out)
 			cmdutil.CheckErr(err)
@@ -40,16 +42,24 @@ func NewCmdApiVersions(f *cmdutil.Factory, out io.Writer) *cobra.Command {
 	return cmd
 }
 
-func RunApiVersions(f *cmdutil.Factory, out io.Writer) error {
-	if os.Args[1] == "apiversions" {
+func RunApiVersions(f *cmdutil.Factory, w io.Writer) error {
+	if len(os.Args) > 1 && os.Args[1] == "apiversions" {
 		printDeprecationWarning("api-versions", "apiversions")
 	}
 
-	client, err := f.Client()
+	clientset, err := f.ClientSet()
 	if err != nil {
 		return err
 	}
 
-	kubectl.GetApiVersions(out, client)
+	groupList, err := clientset.Discovery().ServerGroups()
+	if err != nil {
+		return fmt.Errorf("Couldn't get available api versions from server: %v\n", err)
+	}
+	apiVersions := unversioned.ExtractGroupVersions(groupList)
+	sort.Strings(apiVersions)
+	for _, v := range apiVersions {
+		fmt.Fprintln(w, v)
+	}
 	return nil
 }

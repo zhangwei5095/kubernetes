@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,71 +19,62 @@ package cmd
 import (
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"testing"
 
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/kubernetes/pkg/client/unversioned/fake"
 )
 
 type fakePortForwarder struct {
-	req   *client.Request
-	pfErr error
+	method string
+	url    *url.URL
+	pfErr  error
 }
 
-func (f *fakePortForwarder) ForwardPorts(req *client.Request, config *client.Config, ports []string, stopChan <-chan struct{}) error {
-	f.req = req
+func (f *fakePortForwarder) ForwardPorts(method string, url *url.URL, opts PortForwardOptions) error {
+	f.method = method
+	f.url = url
 	return f.pfErr
 }
 
 func TestPortForward(t *testing.T) {
+	version := testapi.Default.GroupVersion().Version
 
 	tests := []struct {
-		name, version, podPath, pfPath, container string
-		pod                                       *api.Pod
-		pfErr                                     bool
+		name                       string
+		podPath, pfPath, container string
+		pod                        *api.Pod
+		pfErr                      bool
 	}{
 		{
-			name:    "v1beta3 - pod portforward",
-			version: "v1beta3",
-			podPath: "/api/v1beta3/namespaces/test/pods/foo",
-			pfPath:  "/api/v1beta3/namespaces/test/pods/foo/portforward",
+			name:    "pod portforward",
+			podPath: "/api/" + version + "/namespaces/test/pods/foo",
+			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
 			pod:     execPod(),
 		},
 		{
-			name:    "v1beta3 - pod portforward error",
-			version: "v1beta3",
-			podPath: "/api/v1beta3/namespaces/test/pods/foo",
-			pfPath:  "/api/v1beta3/namespaces/test/pods/foo/portforward",
-			pod:     execPod(),
-			pfErr:   true,
-		},
-		{
-			name:    "v1 - pod portforward",
-			version: "v1",
-			podPath: "/api/v1/namespaces/test/pods/foo",
-			pfPath:  "/api/v1/namespaces/test/pods/foo/portforward",
-			pod:     execPod(),
-		},
-		{
-			name:    "v1 - pod portforward error",
-			version: "v1",
-			podPath: "/api/v1/namespaces/test/pods/foo",
-			pfPath:  "/api/v1/namespaces/test/pods/foo/portforward",
+			name:    "pod portforward error",
+			podPath: "/api/" + version + "/namespaces/test/pods/foo",
+			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
 			pod:     execPod(),
 			pfErr:   true,
 		},
 	}
 	for _, test := range tests {
-		f, tf, codec := NewAPIFactory()
-		tf.Client = &client.FakeRESTClient{
-			Codec: codec,
-			Client: client.HTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+		var err error
+		f, tf, codec, ns := NewAPIFactory()
+		tf.Client = &fake.RESTClient{
+			NegotiatedSerializer: ns,
+			Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 				switch p, m := req.URL.Path, req.Method; {
 				case p == test.podPath && m == "GET":
 					body := objBody(codec, test.pod)
-					return &http.Response{StatusCode: 200, Body: body}, nil
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: body}, nil
 				default:
 					// Ensures no GET is performed when deleting by name
 					t.Errorf("%s: unexpected request: %#v\n%#v", test.name, req.URL, req)
@@ -92,23 +83,123 @@ func TestPortForward(t *testing.T) {
 			}),
 		}
 		tf.Namespace = "test"
-		tf.ClientConfig = &client.Config{Version: test.version}
+		tf.ClientConfig = defaultClientConfig()
 		ff := &fakePortForwarder{}
 		if test.pfErr {
 			ff.pfErr = fmt.Errorf("pf error")
 		}
-		cmd := &cobra.Command{}
-		podPtr := cmd.Flags().StringP("pod", "p", "", "Pod name")
-		*podPtr = "foo"
-		err := RunPortForward(f, cmd, []string{":5000", ":1000"}, ff)
-		if test.pfErr && err != ff.pfErr {
-			t.Errorf("%s: Unexpected exec error: %v", test.name, err)
+
+		opts := &PortForwardOptions{}
+		cmd := NewCmdPortForward(f, os.Stdout, os.Stderr)
+		cmd.Run = func(cmd *cobra.Command, args []string) {
+			if err = opts.Complete(f, cmd, args, os.Stdout, os.Stderr); err != nil {
+				return
+			}
+			opts.PortForwarder = ff
+			if err = opts.Validate(); err != nil {
+				return
+			}
+			err = opts.RunPortForward()
 		}
-		if !test.pfErr && ff.req.URL().Path != test.pfPath {
-			t.Errorf("%s: Did not get expected path for portforward request", test.name)
+
+		cmd.Run(cmd, []string{"foo", ":5000", ":1000"})
+
+		if test.pfErr && err != ff.pfErr {
+			t.Errorf("%s: Unexpected port-forward error: %v", test.name, err)
 		}
 		if !test.pfErr && err != nil {
 			t.Errorf("%s: Unexpected error: %v", test.name, err)
+		}
+		if test.pfErr {
+			continue
+		}
+
+		if ff.url.Path != test.pfPath {
+			t.Errorf("%s: Did not get expected path for portforward request", test.name)
+		}
+		if ff.method != "POST" {
+			t.Errorf("%s: Did not get method for attach request: %s", test.name, ff.method)
+		}
+	}
+}
+
+func TestPortForwardWithPFlag(t *testing.T) {
+	version := testapi.Default.GroupVersion().Version
+
+	tests := []struct {
+		name, podPath, pfPath, container string
+		pod                              *api.Pod
+		pfErr                            bool
+	}{
+		{
+			name:    "pod portforward",
+			podPath: "/api/" + version + "/namespaces/test/pods/foo",
+			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
+			pod:     execPod(),
+		},
+		{
+			name:    "pod portforward error",
+			podPath: "/api/" + version + "/namespaces/test/pods/foo",
+			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
+			pod:     execPod(),
+			pfErr:   true,
+		},
+	}
+	for _, test := range tests {
+		var err error
+		f, tf, codec, ns := NewAPIFactory()
+		tf.Client = &fake.RESTClient{
+			NegotiatedSerializer: ns,
+			Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+				switch p, m := req.URL.Path, req.Method; {
+				case p == test.podPath && m == "GET":
+					body := objBody(codec, test.pod)
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: body}, nil
+				default:
+					// Ensures no GET is performed when deleting by name
+					t.Errorf("%s: unexpected request: %#v\n%#v", test.name, req.URL, req)
+					return nil, nil
+				}
+			}),
+		}
+		tf.Namespace = "test"
+		tf.ClientConfig = defaultClientConfig()
+		ff := &fakePortForwarder{}
+		if test.pfErr {
+			ff.pfErr = fmt.Errorf("pf error")
+		}
+
+		opts := &PortForwardOptions{}
+		cmd := NewCmdPortForward(f, os.Stdout, os.Stderr)
+		cmd.Run = func(cmd *cobra.Command, args []string) {
+			if err = opts.Complete(f, cmd, args, os.Stdout, os.Stderr); err != nil {
+				return
+			}
+			opts.PortForwarder = ff
+			if err = opts.Validate(); err != nil {
+				return
+			}
+			err = opts.RunPortForward()
+		}
+		cmd.Flags().Set("pod", "foo")
+
+		cmd.Run(cmd, []string{":5000", ":1000"})
+
+		if test.pfErr && err != ff.pfErr {
+			t.Errorf("%s: Unexpected port-forward error: %v", test.name, err)
+		}
+		if !test.pfErr && err != nil {
+			t.Errorf("%s: Unexpected error: %v", test.name, err)
+		}
+		if test.pfErr {
+			continue
+		}
+
+		if ff.url.Path != test.pfPath {
+			t.Errorf("%s: Did not get expected path for portforward request", test.name)
+		}
+		if ff.method != "POST" {
+			t.Errorf("%s: Did not get method for attach request: %s", test.name, ff.method)
 		}
 	}
 }

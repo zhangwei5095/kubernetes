@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,47 +17,60 @@ limitations under the License.
 package etcd
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	etcdgeneric "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/podtemplate"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/cachesize"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
+	"k8s.io/kubernetes/pkg/registry/podtemplate"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/storage"
 )
 
-// rest implements a RESTStorage for pod templates against etcd
 type REST struct {
-	etcdgeneric.Etcd
+	*registry.Store
 }
 
 // NewREST returns a RESTStorage object that will work against pod templates.
-func NewREST(h tools.EtcdHelper) *REST {
-	prefix := "/podtemplates"
-	store := etcdgeneric.Etcd{
+func NewREST(opts generic.RESTOptions) *REST {
+	prefix := "/" + opts.ResourcePrefix
+
+	newListFunc := func() runtime.Object { return &api.PodTemplateList{} }
+	storageInterface, dFunc := opts.Decorator(
+		opts.StorageConfig,
+		cachesize.GetWatchCacheSizeByResource(cachesize.PodTemplates),
+		&api.PodTemplate{},
+		prefix,
+		podtemplate.Strategy,
+		newListFunc,
+		storage.NoTriggerPublisher,
+	)
+
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.PodTemplate{} },
-		NewListFunc: func() runtime.Object { return &api.PodTemplateList{} },
+		NewListFunc: newListFunc,
 		KeyRootFunc: func(ctx api.Context) string {
-			return etcdgeneric.NamespaceKeyRootFunc(ctx, prefix)
+			return registry.NamespaceKeyRootFunc(ctx, prefix)
 		},
 		KeyFunc: func(ctx api.Context, name string) (string, error) {
-			return etcdgeneric.NamespaceKeyFunc(ctx, prefix, name)
+			return registry.NamespaceKeyFunc(ctx, prefix, name)
 		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.PodTemplate).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return podtemplate.MatchPodTemplate(label, field)
-		},
-		EndpointName: "podtemplates",
+		PredicateFunc:           podtemplate.MatchPodTemplate,
+		QualifiedResource:       api.Resource("podtemplates"),
+		EnableGarbageCollection: opts.EnableGarbageCollection,
+		DeleteCollectionWorkers: opts.DeleteCollectionWorkers,
 
-		CreateStrategy:      podtemplate.Strategy,
-		UpdateStrategy:      podtemplate.Strategy,
+		CreateStrategy: podtemplate.Strategy,
+		UpdateStrategy: podtemplate.Strategy,
+		DeleteStrategy: podtemplate.Strategy,
+		ExportStrategy: podtemplate.Strategy,
+
 		ReturnDeletedObject: true,
 
-		Helper: h,
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
-
 	return &REST{store}
 }

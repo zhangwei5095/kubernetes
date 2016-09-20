@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,6 +47,46 @@ func TestEmptyAggregate(t *testing.T) {
 	err = agg.(error)
 	if s := err.Error(); s != "" {
 		t.Errorf("expected empty string, got %q", s)
+	}
+}
+
+func TestAggregateWithNil(t *testing.T) {
+	var slice []error
+	slice = []error{nil}
+	var agg Aggregate
+	var err error
+
+	agg = NewAggregate(slice)
+	if agg != nil {
+		t.Errorf("expected nil, got %#v", agg)
+	}
+	err = NewAggregate(slice)
+	if err != nil {
+		t.Errorf("expected nil, got %#v", err)
+	}
+
+	// Append a non-nil error
+	slice = append(slice, fmt.Errorf("err"))
+	agg = NewAggregate(slice)
+	if agg == nil {
+		t.Errorf("expected non-nil")
+	}
+	if s := agg.Error(); s != "err" {
+		t.Errorf("expected 'err', got %q", s)
+	}
+	if s := agg.Errors(); len(s) != 1 {
+		t.Errorf("expected one-element slice, got %#v", s)
+	}
+	if s := agg.Errors()[0].Error(); s != "err" {
+		t.Errorf("expected 'err', got %q", s)
+	}
+
+	err = agg.(error)
+	if err == nil {
+		t.Errorf("expected non-nil")
+	}
+	if s := err.Error(); s != "err" {
+		t.Errorf("expected 'err', got %q", s)
 	}
 }
 
@@ -218,6 +258,69 @@ func TestFlatten(t *testing.T) {
 		agg := Flatten(testCase.agg)
 		if !reflect.DeepEqual(testCase.expected, agg) {
 			t.Errorf("%d: expected %v, got %v", i, testCase.expected, agg)
+		}
+	}
+}
+
+func TestAggregateGoroutines(t *testing.T) {
+	testCases := []struct {
+		errs     []error
+		expected map[string]bool // can't compare directly to Aggregate due to non-deterministic ordering
+	}{
+		{
+			[]error{},
+			nil,
+		},
+		{
+			[]error{nil},
+			nil,
+		},
+		{
+			[]error{nil, nil},
+			nil,
+		},
+		{
+			[]error{fmt.Errorf("1")},
+			map[string]bool{"1": true},
+		},
+		{
+			[]error{fmt.Errorf("1"), nil},
+			map[string]bool{"1": true},
+		},
+		{
+			[]error{fmt.Errorf("1"), fmt.Errorf("267")},
+			map[string]bool{"1": true, "267": true},
+		},
+		{
+			[]error{fmt.Errorf("1"), nil, fmt.Errorf("1234")},
+			map[string]bool{"1": true, "1234": true},
+		},
+		{
+			[]error{nil, fmt.Errorf("1"), nil, fmt.Errorf("1234"), fmt.Errorf("22")},
+			map[string]bool{"1": true, "1234": true, "22": true},
+		},
+	}
+	for i, testCase := range testCases {
+		funcs := make([]func() error, len(testCase.errs))
+		for i := range testCase.errs {
+			err := testCase.errs[i]
+			funcs[i] = func() error { return err }
+		}
+		agg := AggregateGoroutines(funcs...)
+		if agg == nil {
+			if len(testCase.expected) > 0 {
+				t.Errorf("%d: expected %v, got nil", i, testCase.expected)
+			}
+			continue
+		}
+		if len(agg.Errors()) != len(testCase.expected) {
+			t.Errorf("%d: expected %d errors in aggregate, got %v", i, len(testCase.expected), agg)
+			continue
+		}
+		for _, err := range agg.Errors() {
+			if !testCase.expected[err.Error()] {
+				t.Errorf("%d: expected %v, got aggregate containing %v", i, testCase.expected, err)
+			}
 		}
 	}
 }

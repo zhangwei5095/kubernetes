@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 import json
 import sys
-# This script helps parse out the private IP addreses from the
+# This script helps parse out the private IP addresses from the
 # `juju run` command's JSON object, see cluster/juju/util.sh
 
 if len(sys.argv) > 1:

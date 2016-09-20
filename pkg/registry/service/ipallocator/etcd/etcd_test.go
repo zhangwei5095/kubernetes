@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,27 +21,22 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coreos/go-etcd/etcd"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/registrytest"
+	"k8s.io/kubernetes/pkg/registry/service/allocator"
+	allocatoretcd "k8s.io/kubernetes/pkg/registry/service/allocator/etcd"
+	"k8s.io/kubernetes/pkg/registry/service/ipallocator"
+	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/kubernetes/pkg/storage/etcd/etcdtest"
+	etcdtesting "k8s.io/kubernetes/pkg/storage/etcd/testing"
+	"k8s.io/kubernetes/pkg/storage/storagebackend/factory"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/service/allocator"
-	allocator_etcd "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/service/allocator/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/service/ipallocator"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools/etcdtest"
+	"golang.org/x/net/context"
 )
 
-func newHelper(t *testing.T) (*tools.FakeEtcdClient, tools.EtcdHelper) {
-	fakeEtcdClient := tools.NewFakeEtcdClient(t)
-	fakeEtcdClient.TestIndex = true
-	helper := tools.NewEtcdHelper(fakeEtcdClient, testapi.Codec(), etcdtest.PathPrefix())
-	return fakeEtcdClient, helper
-}
-
-func newStorage(t *testing.T) (ipallocator.Interface, allocator.Interface, *tools.FakeEtcdClient) {
-	fakeEtcdClient, h := newHelper(t)
+func newStorage(t *testing.T) (*etcdtesting.EtcdTestServer, ipallocator.Interface, allocator.Interface, storage.Interface, factory.DestroyFunc) {
+	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	_, cidr, err := net.ParseCIDR("192.168.1.0/24")
 	if err != nil {
 		t.Fatal(err)
@@ -51,11 +46,22 @@ func newStorage(t *testing.T) (ipallocator.Interface, allocator.Interface, *tool
 	storage := ipallocator.NewAllocatorCIDRRange(cidr, func(max int, rangeSpec string) allocator.Interface {
 		mem := allocator.NewAllocationMap(max, rangeSpec)
 		backing = mem
-		etcd := allocator_etcd.NewEtcd(mem, "/ranges/serviceips", "serviceipallocation", h)
+		etcd := allocatoretcd.NewEtcd(mem, "/ranges/serviceips", api.Resource("serviceipallocations"), etcdStorage)
 		return etcd
 	})
+	s, d := generic.NewRawStorage(etcdStorage)
+	destroyFunc := func() {
+		d()
+		server.Terminate(t)
+	}
+	return server, storage, backing, s, destroyFunc
+}
 
-	return storage, backing, fakeEtcdClient
+func validNewRangeAllocation() *api.RangeAllocation {
+	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
+	return &api.RangeAllocation{
+		Range: cidr.String(),
+	}
 }
 
 func key() string {
@@ -64,44 +70,32 @@ func key() string {
 }
 
 func TestEmpty(t *testing.T) {
-	storage, _, ecli := newStorage(t)
-	ecli.ExpectNotFoundGet(key())
-	if err := storage.Allocate(net.ParseIP("192.168.1.2")); !strings.Contains(err.Error(), "cannot allocate resources of type serviceipallocation at this time") {
+	_, storage, _, _, destroyFunc := newStorage(t)
+	defer destroyFunc()
+	if err := storage.Allocate(net.ParseIP("192.168.1.2")); !strings.Contains(err.Error(), "cannot allocate resources of type serviceipallocations at this time") {
 		t.Fatal(err)
 	}
 }
 
 func TestErrors(t *testing.T) {
-	storage, _, _ := newStorage(t)
+	_, storage, _, _, destroyFunc := newStorage(t)
+	defer destroyFunc()
 	if err := storage.Allocate(net.ParseIP("192.168.0.0")); err != ipallocator.ErrNotInRange {
 		t.Fatal(err)
 	}
 }
 
-func initialObject(ecli *tools.FakeEtcdClient) {
-	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
-	ecli.Data[key()] = tools.EtcdResponseWithError{
-		R: &etcd.Response{
-			Node: &etcd.Node{
-				CreatedIndex:  1,
-				ModifiedIndex: 2,
-				Value: runtime.EncodeOrDie(testapi.Codec(), &api.RangeAllocation{
-					Range: cidr.String(),
-				}),
-			},
-		},
-		E: nil,
-	}
-}
-
 func TestStore(t *testing.T) {
-	storage, r, ecli := newStorage(t)
-	initialObject(ecli)
+	_, storage, backing, si, destroyFunc := newStorage(t)
+	defer destroyFunc()
+	if err := si.Create(context.TODO(), key(), validNewRangeAllocation(), nil, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if err := storage.Allocate(net.ParseIP("192.168.1.2")); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := r.Allocate(1)
+	ok, err := backing.Allocate(1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +105,4 @@ func TestStore(t *testing.T) {
 	if err := storage.Allocate(net.ParseIP("192.168.1.2")); err != ipallocator.ErrAllocated {
 		t.Fatal(err)
 	}
-
-	obj := ecli.Data[key()]
-	if obj.R == nil || obj.R.Node == nil {
-		t.Fatalf("%s is empty: %#v", key(), obj)
-	}
-	t.Logf("data: %#v", obj.R.Node)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,81 +17,173 @@ limitations under the License.
 package priorities
 
 import (
+	"fmt"
 	"math"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/scheduler/algorithm"
-	"github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/scheduler/algorithm/predicates"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/plugin/pkg/scheduler/algorithm"
+	priorityutil "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities/util"
+	schedulerapi "k8s.io/kubernetes/plugin/pkg/scheduler/api"
+	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
-// the unused capacity is calculated on a scale of 0-10
-// 0 being the lowest priority and 10 being the highest
-func calculateScore(requested, capacity int64, node string) int {
+// priorityMetadata is a type that is passed as metadata for priority functions
+type priorityMetadata struct {
+	nonZeroRequest *schedulercache.Resource
+}
+
+func PriorityMetadata(pod *api.Pod, nodes []*api.Node) interface{} {
+	// If we cannot compute metadata, just return nil
+	if pod == nil {
+		return nil
+	}
+	return &priorityMetadata{
+		nonZeroRequest: getNonZeroRequests(pod),
+	}
+}
+
+func getNonZeroRequests(pod *api.Pod) *schedulercache.Resource {
+	result := &schedulercache.Resource{}
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		cpu, memory := priorityutil.GetNonzeroRequests(&container.Resources.Requests)
+		result.MilliCPU += cpu
+		result.Memory += memory
+	}
+	return result
+}
+
+// The unused capacity is calculated on a scale of 0-10
+// 0 being the lowest priority and 10 being the highest.
+// The more unused resources the higher the score is.
+func calculateUnusedScore(requested int64, capacity int64, node string) int64 {
 	if capacity == 0 {
 		return 0
 	}
 	if requested > capacity {
-		glog.Infof("Combined requested resources from existing pods exceeds capacity on minion: %s", node)
+		glog.V(2).Infof("Combined requested resources %d from existing pods exceeds capacity %d on node %s",
+			requested, capacity, node)
 		return 0
 	}
-	return int(((capacity - requested) * 10) / capacity)
+	return ((capacity - requested) * 10) / capacity
 }
 
-// Calculate the occupancy on a node.  'node' has information about the resources on the node.
+// The used capacity is calculated on a scale of 0-10
+// 0 being the lowest priority and 10 being the highest.
+// The more resources are used the higher the score is. This function
+// is almost a reversed version of calculatUnusedScore (10 - calculateUnusedScore).
+// The main difference is in rounding. It was added to keep the
+// final formula clean and not to modify the widely used (by users
+// in their default scheduling policies) calculateUSedScore.
+func calculateUsedScore(requested int64, capacity int64, node string) int64 {
+	if capacity == 0 {
+		return 0
+	}
+	if requested > capacity {
+		glog.V(2).Infof("Combined requested resources %d from existing pods exceeds capacity %d on node %s",
+			requested, capacity, node)
+		return 0
+	}
+	return (requested * 10) / capacity
+}
+
+// Calculates host priority based on the amount of unused resources.
+// 'node' has information about the resources on the node.
 // 'pods' is a list of pods currently scheduled on the node.
-func calculateOccupancy(pod *api.Pod, node api.Node, pods []*api.Pod) algorithm.HostPriority {
-	totalMilliCPU := int64(0)
-	totalMemory := int64(0)
-	for _, existingPod := range pods {
-		for _, container := range existingPod.Spec.Containers {
-			totalMilliCPU += container.Resources.Limits.Cpu().MilliValue()
-			totalMemory += container.Resources.Limits.Memory().Value()
-		}
-	}
-	// Add the resources requested by the current pod being scheduled.
-	// This also helps differentiate between differently sized, but empty, minions.
-	for _, container := range pod.Spec.Containers {
-		totalMilliCPU += container.Resources.Limits.Cpu().MilliValue()
-		totalMemory += container.Resources.Limits.Memory().Value()
+func calculateUnusedPriority(pod *api.Pod, podRequests *schedulercache.Resource, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
 	}
 
-	capacityMilliCPU := node.Status.Capacity.Cpu().MilliValue()
-	capacityMemory := node.Status.Capacity.Memory().Value()
+	allocatableResources := nodeInfo.AllocatableResource()
+	totalResources := *podRequests
+	totalResources.MilliCPU += nodeInfo.NonZeroRequest().MilliCPU
+	totalResources.Memory += nodeInfo.NonZeroRequest().Memory
 
-	cpuScore := calculateScore(totalMilliCPU, capacityMilliCPU, node.Name)
-	memoryScore := calculateScore(totalMemory, capacityMemory, node.Name)
-	glog.V(10).Infof(
-		"%v -> %v: Least Requested Priority, Absolute/Requested: (%d, %d) / (%d, %d) Score: (%d, %d)",
-		pod.Name, node.Name,
-		totalMilliCPU, totalMemory,
-		capacityMilliCPU, capacityMemory,
-		cpuScore, memoryScore,
-	)
+	cpuScore := calculateUnusedScore(totalResources.MilliCPU, allocatableResources.MilliCPU, node.Name)
+	memoryScore := calculateUnusedScore(totalResources.Memory, allocatableResources.Memory, node.Name)
+	if glog.V(10) {
+		// We explicitly don't do glog.V(10).Infof() to avoid computing all the parameters if this is
+		// not logged. There is visible performance gain from it.
+		glog.V(10).Infof(
+			"%v -> %v: Least Requested Priority, capacity %d millicores %d memory bytes, total request %d millicores %d memory bytes, score %d CPU %d memory",
+			pod.Name, node.Name,
+			allocatableResources.MilliCPU, allocatableResources.Memory,
+			totalResources.MilliCPU, totalResources.Memory,
+			cpuScore, memoryScore,
+		)
+	}
 
-	return algorithm.HostPriority{
+	return schedulerapi.HostPriority{
 		Host:  node.Name,
 		Score: int((cpuScore + memoryScore) / 2),
+	}, nil
+}
+
+// Calculate the resource used on a node.  'node' has information about the resources on the node.
+// 'pods' is a list of pods currently scheduled on the node.
+func calculateUsedPriority(pod *api.Pod, podRequests *schedulercache.Resource, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
 	}
+
+	allocatableResources := nodeInfo.AllocatableResource()
+	totalResources := *podRequests
+	totalResources.MilliCPU += nodeInfo.NonZeroRequest().MilliCPU
+	totalResources.Memory += nodeInfo.NonZeroRequest().Memory
+
+	cpuScore := calculateUsedScore(totalResources.MilliCPU, allocatableResources.MilliCPU, node.Name)
+	memoryScore := calculateUsedScore(totalResources.Memory, allocatableResources.Memory, node.Name)
+	if glog.V(10) {
+		// We explicitly don't do glog.V(10).Infof() to avoid computing all the parameters if this is
+		// not logged. There is visible performance gain from it.
+		glog.V(10).Infof(
+			"%v -> %v: Most Requested Priority, capacity %d millicores %d memory bytes, total request %d millicores %d memory bytes, score %d CPU %d memory",
+			pod.Name, node.Name,
+			allocatableResources.MilliCPU, allocatableResources.Memory,
+			totalResources.MilliCPU, totalResources.Memory,
+			cpuScore, memoryScore,
+		)
+	}
+
+	return schedulerapi.HostPriority{
+		Host:  node.Name,
+		Score: int((cpuScore + memoryScore) / 2),
+	}, nil
 }
 
 // LeastRequestedPriority is a priority function that favors nodes with fewer requested resources.
 // It calculates the percentage of memory and CPU requested by pods scheduled on the node, and prioritizes
 // based on the minimum of the average of the fraction of requested to capacity.
-// Details: (Sum(requested cpu) / Capacity + Sum(requested memory) / Capacity) * 50
-func LeastRequestedPriority(pod *api.Pod, podLister algorithm.PodLister, minionLister algorithm.MinionLister) (algorithm.HostPriorityList, error) {
-	nodes, err := minionLister.List()
-	if err != nil {
-		return algorithm.HostPriorityList{}, err
+// Details: cpu((capacity - sum(requested)) * 10 / capacity) + memory((capacity - sum(requested)) * 10 / capacity) / 2
+func LeastRequestedPriorityMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	var nonZeroRequest *schedulercache.Resource
+	if priorityMeta, ok := meta.(*priorityMetadata); ok {
+		nonZeroRequest = priorityMeta.nonZeroRequest
+	} else {
+		// We couldn't parse metadata - fallback to computing it.
+		nonZeroRequest = getNonZeroRequests(pod)
 	}
-	podsToMachines, err := predicates.MapPodsToMachines(podLister)
+	return calculateUnusedPriority(pod, nonZeroRequest, nodeInfo)
+}
 
-	list := algorithm.HostPriorityList{}
-	for _, node := range nodes.Items {
-		list = append(list, calculateOccupancy(pod, node, podsToMachines[node.Name]))
+// MostRequestedPriority is a priority function that favors nodes with most requested resources.
+// It calculates the percentage of memory and CPU requested by pods scheduled on the node, and prioritizes
+// based on the maximum of the average of the fraction of requested to capacity.
+// Details: (cpu(10 * sum(requested) / capacity) + memory(10 * sum(requested) / capacity)) / 2
+func MostRequestedPriorityMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	var nonZeroRequest *schedulercache.Resource
+	if priorityMeta, ok := meta.(*priorityMetadata); ok {
+		nonZeroRequest = priorityMeta.nonZeroRequest
+	} else {
+		// We couldn't parse metadatat - fallback to computing it.
+		nonZeroRequest = getNonZeroRequests(pod)
 	}
-	return list, nil
+	return calculateUsedPriority(pod, nonZeroRequest, nodeInfo)
 }
 
 type NodeLabelPrioritizer struct {
@@ -99,42 +191,93 @@ type NodeLabelPrioritizer struct {
 	presence bool
 }
 
-func NewNodeLabelPriority(label string, presence bool) algorithm.PriorityFunction {
+func NewNodeLabelPriority(label string, presence bool) (algorithm.PriorityMapFunction, algorithm.PriorityReduceFunction) {
 	labelPrioritizer := &NodeLabelPrioritizer{
 		label:    label,
 		presence: presence,
 	}
-	return labelPrioritizer.CalculateNodeLabelPriority
+	return labelPrioritizer.CalculateNodeLabelPriorityMap, nil
 }
 
-// CalculateNodeLabelPriority checks whether a particular label exists on a minion or not, regardless of its value.
-// If presence is true, prioritizes minions that have the specified label, regardless of value.
-// If presence is false, prioritizes minions that do not have the specified label.
-func (n *NodeLabelPrioritizer) CalculateNodeLabelPriority(pod *api.Pod, podLister algorithm.PodLister, minionLister algorithm.MinionLister) (algorithm.HostPriorityList, error) {
-	var score int
-	minions, err := minionLister.List()
-	if err != nil {
-		return nil, err
+// CalculateNodeLabelPriority checks whether a particular label exists on a node or not, regardless of its value.
+// If presence is true, prioritizes nodes that have the specified label, regardless of value.
+// If presence is false, prioritizes nodes that do not have the specified label.
+func (n *NodeLabelPrioritizer) CalculateNodeLabelPriorityMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
 	}
 
-	labeledMinions := map[string]bool{}
-	for _, minion := range minions.Items {
-		exists := labels.Set(minion.Labels).Has(n.label)
-		labeledMinions[minion.Name] = (exists && n.presence) || (!exists && !n.presence)
+	exists := labels.Set(node.Labels).Has(n.label)
+	score := 0
+	if (exists && n.presence) || (!exists && !n.presence) {
+		score = 10
+	}
+	return schedulerapi.HostPriority{
+		Host:  node.Name,
+		Score: score,
+	}, nil
+}
+
+// This is a reasonable size range of all container images. 90%ile of images on dockerhub drops into this range.
+const (
+	mb         int64 = 1024 * 1024
+	minImgSize int64 = 23 * mb
+	maxImgSize int64 = 1000 * mb
+)
+
+// ImageLocalityPriority is a priority function that favors nodes that already have requested pod container's images.
+// It will detect whether the requested images are present on a node, and then calculate a score ranging from 0 to 10
+// based on the total size of those images.
+// - If none of the images are present, this node will be given the lowest priority.
+// - If some of the images are present on a node, the larger their sizes' sum, the higher the node's priority.
+func ImageLocalityPriorityMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
 	}
 
-	result := []algorithm.HostPriority{}
-	//score int - scale of 0-10
-	// 0 being the lowest priority and 10 being the highest
-	for minionName, success := range labeledMinions {
-		if success {
-			score = 10
-		} else {
-			score = 0
+	var sumSize int64
+	for i := range pod.Spec.Containers {
+		sumSize += checkContainerImageOnNode(node, &pod.Spec.Containers[i])
+	}
+	return schedulerapi.HostPriority{
+		Host:  node.Name,
+		Score: calculateScoreFromSize(sumSize),
+	}, nil
+}
+
+// checkContainerImageOnNode checks if a container image is present on a node and returns its size.
+func checkContainerImageOnNode(node *api.Node, container *api.Container) int64 {
+	for _, image := range node.Status.Images {
+		for _, name := range image.Names {
+			if container.Image == name {
+				// Should return immediately.
+				return image.SizeBytes
+			}
 		}
-		result = append(result, algorithm.HostPriority{Host: minionName, Score: score})
 	}
-	return result, nil
+	return 0
+}
+
+// calculateScoreFromSize calculates the priority of a node. sumSize is sum size of requested images on this node.
+// 1. Split image size range into 10 buckets.
+// 2. Decide the priority of a given sumSize based on which bucket it belongs to.
+func calculateScoreFromSize(sumSize int64) int {
+	var score int
+	switch {
+	case sumSize == 0 || sumSize < minImgSize:
+		// score == 0 means none of the images required by this pod are present on this
+		// node or the total size of the images present is too small to be taken into further consideration.
+		score = 0
+	// If existing images' total size is larger than max, just make it highest priority.
+	case sumSize >= maxImgSize:
+		score = 10
+	default:
+		score = int((10 * (sumSize - minImgSize) / (maxImgSize - minImgSize)) + 1)
+	}
+	// Return which bucket the given size belongs to
+	return score
 }
 
 // BalancedResourceAllocation favors nodes with balanced resource usage rate.
@@ -143,42 +286,31 @@ func (n *NodeLabelPrioritizer) CalculateNodeLabelPriority(pod *api.Pod, podListe
 // close the two metrics are to each other.
 // Detail: score = 10 - abs(cpuFraction-memoryFraction)*10. The algorithm is partly inspired by:
 // "Wei Huang et al. An Energy Efficient Virtual Machine Placement Algorithm with Balanced Resource Utilization"
-func BalancedResourceAllocation(pod *api.Pod, podLister algorithm.PodLister, minionLister algorithm.MinionLister) (algorithm.HostPriorityList, error) {
-	nodes, err := minionLister.List()
-	if err != nil {
-		return algorithm.HostPriorityList{}, err
+func BalancedResourceAllocationMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	var nonZeroRequest *schedulercache.Resource
+	if priorityMeta, ok := meta.(*priorityMetadata); ok {
+		nonZeroRequest = priorityMeta.nonZeroRequest
+	} else {
+		// We couldn't parse metadatat - fallback to computing it.
+		nonZeroRequest = getNonZeroRequests(pod)
 	}
-	podsToMachines, err := predicates.MapPodsToMachines(podLister)
-
-	list := algorithm.HostPriorityList{}
-	for _, node := range nodes.Items {
-		list = append(list, calculateBalancedResourceAllocation(pod, node, podsToMachines[node.Name]))
-	}
-	return list, nil
+	return calculateBalancedResourceAllocation(pod, nonZeroRequest, nodeInfo)
 }
 
-func calculateBalancedResourceAllocation(pod *api.Pod, node api.Node, pods []*api.Pod) algorithm.HostPriority {
-	totalMilliCPU := int64(0)
-	totalMemory := int64(0)
+func calculateBalancedResourceAllocation(pod *api.Pod, podRequests *schedulercache.Resource, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
+	}
+
+	allocatableResources := nodeInfo.AllocatableResource()
+	totalResources := *podRequests
+	totalResources.MilliCPU += nodeInfo.NonZeroRequest().MilliCPU
+	totalResources.Memory += nodeInfo.NonZeroRequest().Memory
+
+	cpuFraction := fractionOfCapacity(totalResources.MilliCPU, allocatableResources.MilliCPU)
+	memoryFraction := fractionOfCapacity(totalResources.Memory, allocatableResources.Memory)
 	score := int(0)
-	for _, existingPod := range pods {
-		for _, container := range existingPod.Spec.Containers {
-			totalMilliCPU += container.Resources.Limits.Cpu().MilliValue()
-			totalMemory += container.Resources.Limits.Memory().Value()
-		}
-	}
-	// Add the resources requested by the current pod being scheduled.
-	// This also helps differentiate between differently sized, but empty, minions.
-	for _, container := range pod.Spec.Containers {
-		totalMilliCPU += container.Resources.Limits.Cpu().MilliValue()
-		totalMemory += container.Resources.Limits.Memory().Value()
-	}
-
-	capacityMilliCPU := node.Status.Capacity.Cpu().MilliValue()
-	capacityMemory := node.Status.Capacity.Memory().Value()
-
-	cpuFraction := fractionOfCapacity(totalMilliCPU, capacityMilliCPU, node.Name)
-	memoryFraction := fractionOfCapacity(totalMemory, capacityMemory, node.Name)
 	if cpuFraction >= 1 || memoryFraction >= 1 {
 		// if requested >= capacity, the corresponding host should never be preferrred.
 		score = 0
@@ -190,23 +322,61 @@ func calculateBalancedResourceAllocation(pod *api.Pod, node api.Node, pods []*ap
 		diff := math.Abs(cpuFraction - memoryFraction)
 		score = int(10 - diff*10)
 	}
-	glog.V(10).Infof(
-		"%v -> %v: Balanced Resource Allocation, Absolute/Requested: (%d, %d) / (%d, %d) Score: (%d)",
-		pod.Name, node.Name,
-		totalMilliCPU, totalMemory,
-		capacityMilliCPU, capacityMemory,
-		score,
-	)
+	if glog.V(10) {
+		// We explicitly don't do glog.V(10).Infof() to avoid computing all the parameters if this is
+		// not logged. There is visible performance gain from it.
+		glog.V(10).Infof(
+			"%v -> %v: Balanced Resource Allocation, capacity %d millicores %d memory bytes, total request %d millicores %d memory bytes, score %d",
+			pod.Name, node.Name,
+			allocatableResources.MilliCPU, allocatableResources.Memory,
+			totalResources.MilliCPU, totalResources.Memory,
+			score,
+		)
+	}
 
-	return algorithm.HostPriority{
+	return schedulerapi.HostPriority{
 		Host:  node.Name,
 		Score: score,
-	}
+	}, nil
 }
 
-func fractionOfCapacity(requested, capacity int64, node string) float64 {
+func fractionOfCapacity(requested, capacity int64) float64 {
 	if capacity == 0 {
 		return 1
 	}
 	return float64(requested) / float64(capacity)
+}
+
+func CalculateNodePreferAvoidPodsPriorityMap(pod *api.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	if node == nil {
+		return schedulerapi.HostPriority{}, fmt.Errorf("node not found")
+	}
+
+	controllerRef := priorityutil.GetControllerRef(pod)
+	if controllerRef != nil {
+		// Ignore pods that are owned by other controller than ReplicationController
+		// or ReplicaSet.
+		if controllerRef.Kind != "ReplicationController" && controllerRef.Kind != "ReplicaSet" {
+			controllerRef = nil
+		}
+	}
+	if controllerRef == nil {
+		return schedulerapi.HostPriority{Host: node.Name, Score: 10}, nil
+	}
+
+	avoids, err := api.GetAvoidPodsFromNodeAnnotations(node.Annotations)
+	if err != nil {
+		// If we cannot get annotation, assume it's schedulable there.
+		return schedulerapi.HostPriority{Host: node.Name, Score: 10}, nil
+	}
+	for i := range avoids.PreferAvoidPods {
+		avoid := &avoids.PreferAvoidPods[i]
+		if controllerRef != nil {
+			if avoid.PodSignature.PodController.Kind == controllerRef.Kind && avoid.PodSignature.PodController.UID == controllerRef.UID {
+				return schedulerapi.HostPriority{Host: node.Name, Score: 0}, nil
+			}
+		}
+	}
+	return schedulerapi.HostPriority{Host: node.Name, Score: 10}, nil
 }

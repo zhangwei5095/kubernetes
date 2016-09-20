@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -226,6 +226,7 @@ func TestDQ_ordered_add_pop(t *testing.T) {
 }
 
 func TestDQ_always_pop_earliest_deadline(t *testing.T) {
+	t.Skip("disabled due to flakiness; see #11857")
 	t.Parallel()
 
 	// add a testjob with delay of 2s
@@ -264,6 +265,7 @@ func TestDQ_always_pop_earliest_deadline(t *testing.T) {
 }
 
 func TestDQ_always_pop_earliest_deadline_multi(t *testing.T) {
+	t.Skip("disabled due to flakiness; see #11821")
 	t.Parallel()
 
 	dq := NewDelayQueue()
@@ -356,7 +358,7 @@ func TestDFIFO_sanity_check(t *testing.T) {
 
 	// pop last
 	before := time.Now()
-	x := df.Pop()
+	x := df.Pop(WithoutCancel())
 	assert.Equal(a.(*testjob).instance, 2)
 
 	now := time.Now()
@@ -393,7 +395,7 @@ func TestDFIFO_Offer(t *testing.T) {
 	}
 
 	before := time.Now()
-	x := dq.Pop()
+	x := dq.Pop(WithoutCancel())
 
 	now := time.Now()
 	waitPeriod := now.Sub(before)

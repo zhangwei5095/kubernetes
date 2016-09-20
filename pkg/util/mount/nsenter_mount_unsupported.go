@@ -1,7 +1,7 @@
 // +build !linux
 
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,10 @@ package mount
 
 type NsenterMounter struct{}
 
+func NewNsenterMounter() *NsenterMounter {
+	return &NsenterMounter{}
+}
+
 var _ = Interface(&NsenterMounter{})
 
 func (*NsenterMounter) Mount(source string, target string, fstype string, options []string) error {
@@ -34,6 +38,18 @@ func (*NsenterMounter) List() ([]MountPoint, error) {
 	return []MountPoint{}, nil
 }
 
-func (*NsenterMounter) IsMountPoint(file string) (bool, error) {
+func (*NsenterMounter) IsLikelyNotMountPoint(file string) (bool, error) {
+	return true, nil
+}
+
+func (*NsenterMounter) DeviceOpened(pathname string) (bool, error) {
 	return false, nil
+}
+
+func (*NsenterMounter) PathIsDevice(pathname string) (bool, error) {
+	return true, nil
+}
+
+func (*NsenterMounter) GetDeviceNameFromMount(mountPath, pluginDir string) (string, error) {
+	return "", nil
 }

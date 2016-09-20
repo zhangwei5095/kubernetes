@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,54 +20,44 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/util/uuid"
+	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/test/e2e/framework"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("ReplicationController", func() {
-	var c *client.Client
+var _ = framework.KubeDescribe("ReplicationController", func() {
+	f := framework.NewDefaultFramework("replication-controller")
 
-	BeforeEach(func() {
-		var err error
-		c, err = loadClient()
-		Expect(err).NotTo(HaveOccurred())
-	})
-
-	It("should serve a basic image on each replica with a public image", func() {
-		ServeImageOrFail(c, "basic", "gcr.io/google_containers/serve_hostname:1.1")
+	It("should serve a basic image on each replica with a public image [Conformance]", func() {
+		ServeImageOrFail(f, "basic", "gcr.io/google_containers/serve_hostname:v1.4")
 	})
 
 	It("should serve a basic image on each replica with a private image", func() {
 		// requires private images
-		SkipUnlessProviderIs("gce", "gke")
+		framework.SkipUnlessProviderIs("gce", "gke")
 
-		ServeImageOrFail(c, "private", "gcr.io/_b_k8s_authenticated_test/serve_hostname:1.1")
+		ServeImageOrFail(f, "private", "b.gcr.io/k8s_authenticated_test/serve_hostname:v1.4")
 	})
 })
 
 // A basic test to check the deployment of an image using
 // a replication controller. The image serves its hostname
 // which is checked for each replica.
-func ServeImageOrFail(c *client.Client, test string, image string) {
-	ns := api.NamespaceDefault
-	name := "my-hostname-" + test + "-" + string(util.NewUUID())
-	replicas := 2
+func ServeImageOrFail(f *framework.Framework, test string, image string) {
+	name := "my-hostname-" + test + "-" + string(uuid.NewUUID())
+	replicas := int32(2)
 
 	// Create a replication controller for a service
 	// that serves its hostname.
 	// The source for the Docker containter kubernetes/serve_hostname is
 	// in contrib/for-demos/serve_hostname
 	By(fmt.Sprintf("Creating replication controller %s", name))
-	controller, err := c.ReplicationControllers(ns).Create(&api.ReplicationController{
+	controller, err := f.Client.ReplicationControllers(f.Namespace.Name).Create(&api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
 			Name: name,
 		},
@@ -96,42 +86,25 @@ func ServeImageOrFail(c *client.Client, test string, image string) {
 	// Cleanup the replication controller when we are done.
 	defer func() {
 		// Resize the replication controller to zero to get rid of pods.
-		By("Cleaning up the replication controller")
-		rcReaper, err := kubectl.ReaperFor("ReplicationController", c)
-		if err != nil {
-			Logf("Failed to cleanup replication controller %v: %v.", controller.Name, err)
-		}
-		if _, err = rcReaper.Stop(ns, controller.Name, 0, nil); err != nil {
-			Logf("Failed to stop replication controller %v: %v.", controller.Name, err)
+		if err := framework.DeleteRCAndPods(f.Client, f.Namespace.Name, controller.Name); err != nil {
+			framework.Logf("Failed to cleanup replication controller %v: %v.", controller.Name, err)
 		}
 	}()
 
 	// List the pods, making sure we observe all the replicas.
-	listTimeout := time.Minute
 	label := labels.SelectorFromSet(labels.Set(map[string]string{"name": name}))
-	pods, err := c.Pods(ns).List(label, fields.Everything())
-	Expect(err).NotTo(HaveOccurred())
-	t := time.Now()
-	for {
-		Logf("Controller %s: Found %d pods out of %d", name, len(pods.Items), replicas)
-		if len(pods.Items) == replicas {
-			break
-		}
-		if time.Since(t) > listTimeout {
-			Failf("Controller %s: Gave up waiting for %d pods to come up after seeing only %d pods after %v seconds",
-				name, replicas, len(pods.Items), time.Since(t).Seconds())
-		}
-		time.Sleep(5 * time.Second)
-		pods, err = c.Pods(ns).List(label, fields.Everything())
-		Expect(err).NotTo(HaveOccurred())
-	}
+
+	pods, err := framework.PodsCreated(f.Client, f.Namespace.Name, name, replicas)
 
 	By("Ensuring each pod is running")
 
 	// Wait for the pods to enter the running state. Waiting loops until the pods
 	// are running so non-running pods cause a timeout for this test.
 	for _, pod := range pods.Items {
-		err = waitForPodRunning(c, pod.Name)
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		err = f.WaitForPodRunning(pod.Name)
 		Expect(err).NotTo(HaveOccurred())
 	}
 
@@ -139,17 +112,8 @@ func ServeImageOrFail(c *client.Client, test string, image string) {
 	By("Trying to dial each unique pod")
 	retryTimeout := 2 * time.Minute
 	retryInterval := 5 * time.Second
-	err = wait.Poll(retryInterval, retryTimeout, podResponseChecker{c, ns, label, name, true, pods}.checkAllResponses)
+	err = wait.Poll(retryInterval, retryTimeout, framework.PodProxyResponseChecker(f.Client, f.Namespace.Name, label, name, true, pods).CheckAllResponses)
 	if err != nil {
-		Failf("Did not get expected responses within the timeout period of %.2f seconds.", retryTimeout.Seconds())
+		framework.Failf("Did not get expected responses within the timeout period of %.2f seconds.", retryTimeout.Seconds())
 	}
-}
-
-func isElementOf(podUID types.UID, pods *api.PodList) bool {
-	for _, pod := range pods.Items {
-		if pod.UID == podUID {
-			return true
-		}
-	}
-	return false
 }

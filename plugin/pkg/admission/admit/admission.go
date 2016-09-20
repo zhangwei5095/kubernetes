@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,13 @@ package admit
 import (
 	"io"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/admission"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+
+	"k8s.io/kubernetes/pkg/admission"
 )
 
 func init() {
-	admission.RegisterPlugin("AlwaysAdmit", func(client client.Interface, config io.Reader) (admission.Interface, error) {
+	admission.RegisterPlugin("AlwaysAdmit", func(client clientset.Interface, config io.Reader) (admission.Interface, error) {
 		return NewAlwaysAdmit(), nil
 	})
 }

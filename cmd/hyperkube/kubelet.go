@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@ limitations under the License.
 package main
 
 import (
-	kubelet "github.com/GoogleCloudPlatform/kubernetes/cmd/kubelet/app"
+	"k8s.io/kubernetes/cmd/kubelet/app"
+	"k8s.io/kubernetes/cmd/kubelet/app/options"
 )
 
 // NewKubelet creates a new hyperkube Server object that includes the
 // description and flags.
 func NewKubelet() *Server {
-	s := kubelet.NewKubeletServer()
+	s := options.NewKubeletServer()
 	hks := Server{
 		SimpleUsage: "kubelet",
 		Long: `The kubelet binary is responsible for maintaining a set of containers on a
@@ -32,8 +33,8 @@ func NewKubelet() *Server {
 		queries Docker to see what is currently running.  It synchronizes the
 		configuration data, with the running set of containers by starting or stopping
 		Docker containers.`,
-		Run: func(_ *Server, args []string) error {
-			return s.Run(args)
+		Run: func(_ *Server, _ []string) error {
+			return app.Run(s, nil)
 		},
 	}
 	s.AddFlags(hks.Flags())

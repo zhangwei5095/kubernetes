@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,11 +20,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/watch"
 )
 
 // Registry is an interface for things that know how to store endpoints.
@@ -36,7 +34,7 @@ type EndpointRegistry struct {
 	lock sync.Mutex
 }
 
-func (e *EndpointRegistry) ListEndpoints(ctx api.Context) (*api.EndpointsList, error) {
+func (e *EndpointRegistry) ListEndpoints(ctx api.Context, options *api.ListOptions) (*api.EndpointsList, error) {
 	// TODO: support namespaces in this mock
 	e.lock.Lock()
 	defer e.lock.Unlock()
@@ -58,10 +56,10 @@ func (e *EndpointRegistry) GetEndpoints(ctx api.Context, name string) (*api.Endp
 			}
 		}
 	}
-	return nil, errors.NewNotFound("Endpoints", name)
+	return nil, errors.NewNotFound(api.Resource("endpoints"), name)
 }
 
-func (e *EndpointRegistry) WatchEndpoints(ctx api.Context, labels labels.Selector, fields fields.Selector, resourceVersion string) (watch.Interface, error) {
+func (e *EndpointRegistry) WatchEndpoints(ctx api.Context, options *api.ListOptions) (watch.Interface, error) {
 	return nil, fmt.Errorf("unimplemented!")
 }
 
@@ -93,5 +91,20 @@ func (e *EndpointRegistry) UpdateEndpoints(ctx api.Context, endpoints *api.Endpo
 }
 
 func (e *EndpointRegistry) DeleteEndpoints(ctx api.Context, name string) error {
-	return fmt.Errorf("unimplemented!")
+	// TODO: support namespaces in this mock
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	if e.Err != nil {
+		return e.Err
+	}
+	if e.Endpoints != nil {
+		var newList []api.Endpoints
+		for _, endpoint := range e.Endpoints.Items {
+			if endpoint.Name != name {
+				newList = append(newList, endpoint)
+			}
+		}
+		e.Endpoints.Items = newList
+	}
+	return nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,139 +19,148 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
-	"strconv"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/util/intstr"
+	"k8s.io/kubernetes/test/e2e/framework"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/autoscaling"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"k8s.io/kubernetes/pkg/client/cache"
+	awscloud "k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
+	"k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/watch"
 )
 
-const serveHostnameImage = "gcr.io/google_containers/serve_hostname:1.1"
+const (
+	serveHostnameImage        = "gcr.io/google_containers/serve_hostname:v1.4"
+	resizeNodeReadyTimeout    = 2 * time.Minute
+	resizeNodeNotReadyTimeout = 2 * time.Minute
+	nodeReadinessTimeout      = 3 * time.Minute
+	podNotReadyTimeout        = 1 * time.Minute
+	podReadyTimeout           = 2 * time.Minute
+	testPort                  = 9376
+)
 
-func resizeGroup(size int) error {
-	if testContext.Provider == "gce" || testContext.Provider == "gke" {
-		// TODO: make this hit the compute API directly instread of shelling out to gcloud.
+func ResizeGroup(group string, size int32) error {
+	if framework.TestContext.ReportDir != "" {
+		framework.CoreDump(framework.TestContext.ReportDir)
+		defer framework.CoreDump(framework.TestContext.ReportDir)
+	}
+	if framework.TestContext.Provider == "gce" || framework.TestContext.Provider == "gke" {
+		// TODO: make this hit the compute API directly instead of shelling out to gcloud.
 		// TODO: make gce/gke implement InstanceGroups, so we can eliminate the per-provider logic
-		output, err := exec.Command("gcloud", "preview", "managed-instance-groups", "--project="+testContext.CloudConfig.ProjectID, "--zone="+testContext.CloudConfig.Zone,
-			"resize", testContext.CloudConfig.NodeInstanceGroup, fmt.Sprintf("--new-size=%v", size)).CombinedOutput()
+		output, err := exec.Command("gcloud", "compute", "instance-groups", "managed", "resize",
+			group, fmt.Sprintf("--size=%v", size),
+			"--project="+framework.TestContext.CloudConfig.ProjectID, "--zone="+framework.TestContext.CloudConfig.Zone).CombinedOutput()
 		if err != nil {
-			Logf("Failed to resize node instance group: %v", string(output))
+			framework.Logf("Failed to resize node instance group: %v", string(output))
 		}
 		return err
+	} else if framework.TestContext.Provider == "aws" {
+		client := autoscaling.New(session.New())
+		return awscloud.ResizeInstanceGroup(client, group, int(size))
 	} else {
-		// Supported by aws
-		instanceGroups, ok := testContext.CloudConfig.Provider.(aws_cloud.InstanceGroups)
-		if !ok {
-			return fmt.Errorf("Provider does not support InstanceGroups")
-		}
-		return instanceGroups.ResizeInstanceGroup(testContext.CloudConfig.NodeInstanceGroup, size)
+		return fmt.Errorf("Provider does not support InstanceGroups")
 	}
 }
 
-func groupSize() (int, error) {
-	if testContext.Provider == "gce" || testContext.Provider == "gke" {
-		// TODO: make this hit the compute API directly instread of shelling out to gcloud.
+func GetGroupNodes(group string) ([]string, error) {
+	if framework.TestContext.Provider == "gce" || framework.TestContext.Provider == "gke" {
+		// TODO: make this hit the compute API directly instead of shelling out to gcloud.
 		// TODO: make gce/gke implement InstanceGroups, so we can eliminate the per-provider logic
-		output, err := exec.Command("gcloud", "preview", "managed-instance-groups", "--project="+testContext.CloudConfig.ProjectID,
-			"--zone="+testContext.CloudConfig.Zone, "describe", testContext.CloudConfig.NodeInstanceGroup).CombinedOutput()
+		output, err := exec.Command("gcloud", "compute", "instance-groups", "managed",
+			"list-instances", group, "--project="+framework.TestContext.CloudConfig.ProjectID,
+			"--zone="+framework.TestContext.CloudConfig.Zone).CombinedOutput()
 		if err != nil {
-			return -1, err
+			return nil, err
 		}
-		pattern := "currentSize: "
-		i := strings.Index(string(output), pattern)
-		if i == -1 {
-			return -1, fmt.Errorf("could not find '%s' in the output '%s'", pattern, output)
+		re := regexp.MustCompile(".*RUNNING")
+		lines := re.FindAllString(string(output), -1)
+		for i, line := range lines {
+			lines[i] = line[:strings.Index(line, " ")]
 		}
-		truncated := output[i+len(pattern):]
-		j := strings.Index(string(truncated), "\n")
-		if j == -1 {
-			return -1, fmt.Errorf("could not find new line in the truncated output '%s'", truncated)
-		}
-
-		currentSize, err := strconv.Atoi(string(truncated[:j]))
-		if err != nil {
-			return -1, err
-		}
-		return currentSize, nil
+		return lines, nil
 	} else {
-		// Supported by aws
-		instanceGroups, ok := testContext.CloudConfig.Provider.(aws_cloud.InstanceGroups)
-		if !ok {
-			return -1, fmt.Errorf("provider does not support InstanceGroups")
+		return nil, fmt.Errorf("provider does not support InstanceGroups")
+	}
+}
+
+func GroupSize(group string) (int, error) {
+	if framework.TestContext.Provider == "gce" || framework.TestContext.Provider == "gke" {
+		// TODO: make this hit the compute API directly instead of shelling out to gcloud.
+		// TODO: make gce/gke implement InstanceGroups, so we can eliminate the per-provider logic
+		output, err := exec.Command("gcloud", "compute", "instance-groups", "managed",
+			"list-instances", group, "--project="+framework.TestContext.CloudConfig.ProjectID,
+			"--zone="+framework.TestContext.CloudConfig.Zone).CombinedOutput()
+		if err != nil {
+			return -1, err
 		}
-		instanceGroup, err := instanceGroups.DescribeInstanceGroup(testContext.CloudConfig.NodeInstanceGroup)
+		re := regexp.MustCompile("RUNNING")
+		return len(re.FindAllString(string(output), -1)), nil
+	} else if framework.TestContext.Provider == "aws" {
+		client := autoscaling.New(session.New())
+		instanceGroup, err := awscloud.DescribeInstanceGroup(client, group)
 		if err != nil {
 			return -1, fmt.Errorf("error describing instance group: %v", err)
 		}
 		if instanceGroup == nil {
-			return -1, fmt.Errorf("instance group not found: %s", testContext.CloudConfig.NodeInstanceGroup)
+			return -1, fmt.Errorf("instance group not found: %s", group)
 		}
 		return instanceGroup.CurrentSize()
+	} else {
+		return -1, fmt.Errorf("provider does not support InstanceGroups")
 	}
 }
 
-func waitForGroupSize(size int) error {
-	for start := time.Now(); time.Since(start) < 4*time.Minute; time.Sleep(5 * time.Second) {
-		currentSize, err := groupSize()
+func WaitForGroupSize(group string, size int32) error {
+	timeout := 10 * time.Minute
+	for start := time.Now(); time.Since(start) < timeout; time.Sleep(5 * time.Second) {
+		currentSize, err := GroupSize(group)
 		if err != nil {
-			Logf("Failed to get node instance group size: %v", err)
+			framework.Logf("Failed to get node instance group size: %v", err)
 			continue
 		}
-		if currentSize != size {
-			Logf("Waiting for node instance group size %d, current size %d", size, currentSize)
+		if currentSize != int(size) {
+			framework.Logf("Waiting for node instance group size %d, current size %d", size, currentSize)
 			continue
 		}
-		Logf("Node instance group has reached the desired size %d", size)
+		framework.Logf("Node instance group has reached the desired size %d", size)
 		return nil
 	}
-	return fmt.Errorf("timeout waiting for node instance group size to be %d", size)
+	return fmt.Errorf("timeout waiting %v for node instance group size to be %d", timeout, size)
 }
 
-func waitForClusterSize(c *client.Client, size int) error {
-	for start := time.Now(); time.Since(start) < 4*time.Minute; time.Sleep(20 * time.Second) {
-		nodes, err := c.Nodes().List(labels.Everything(), fields.Everything())
-		if err != nil {
-			Logf("Failed to list nodes: %v", err)
-			continue
-		}
-		if len(nodes.Items) == size {
-			Logf("Cluster has reached the desired size %d", size)
-			return nil
-		}
-		Logf("Waiting for cluster size %d, current size %d", size, len(nodes.Items))
-	}
-	return fmt.Errorf("timeout waiting for cluster size to be %d", size)
-}
-
-func svcByName(name string) *api.Service {
+func svcByName(name string, port int) *api.Service {
 	return &api.Service{
 		ObjectMeta: api.ObjectMeta{
-			Name: "test-service",
+			Name: name,
 		},
 		Spec: api.ServiceSpec{
+			Type: api.ServiceTypeNodePort,
 			Selector: map[string]string{
 				"name": name,
 			},
 			Ports: []api.ServicePort{{
-				Port:       9376,
-				TargetPort: util.NewIntOrStringFromInt(9376),
+				Port:       int32(port),
+				TargetPort: intstr.FromInt(port),
 			}},
 		},
 	}
 }
 
 func newSVCByName(c *client.Client, ns, name string) error {
-	_, err := c.Services(ns).Create(svcByName(name))
+	_, err := c.Services(ns).Create(svcByName(name, testPort))
 	return err
 }
 
@@ -180,35 +189,36 @@ func podOnNode(podName, nodeName string, image string) *api.Pod {
 func newPodOnNode(c *client.Client, namespace, podName, nodeName string) error {
 	pod, err := c.Pods(namespace).Create(podOnNode(podName, nodeName, serveHostnameImage))
 	if err == nil {
-		Logf("Created pod %s on node %s", pod.ObjectMeta.Name, nodeName)
+		framework.Logf("Created pod %s on node %s", pod.ObjectMeta.Name, nodeName)
 	} else {
-		Logf("Failed to create pod %s on node %s: %v", podName, nodeName, err)
+		framework.Logf("Failed to create pod %s on node %s: %v", podName, nodeName, err)
 	}
 	return err
 }
 
-func rcByName(name string, replicas int, image string, labels map[string]string) *api.ReplicationController {
+func rcByName(name string, replicas int32, image string, labels map[string]string) *api.ReplicationController {
 	return rcByNameContainer(name, replicas, image, labels, api.Container{
 		Name:  name,
 		Image: image,
 	})
 }
 
-func rcByNamePort(name string, replicas int, image string, port int, labels map[string]string) *api.ReplicationController {
+func rcByNamePort(name string, replicas int32, image string, port int, protocol api.Protocol, labels map[string]string) *api.ReplicationController {
 	return rcByNameContainer(name, replicas, image, labels, api.Container{
 		Name:  name,
 		Image: image,
-		Ports: []api.ContainerPort{{ContainerPort: port}},
+		Ports: []api.ContainerPort{{ContainerPort: int32(port), Protocol: protocol}},
 	})
 }
 
-func rcByNameContainer(name string, replicas int, image string, labels map[string]string, c api.Container) *api.ReplicationController {
+func rcByNameContainer(name string, replicas int32, image string, labels map[string]string, c api.Container) *api.ReplicationController {
 	// Add "name": name to the labels, overwriting if it exists.
 	labels["name"] = name
+	gracePeriod := int64(0)
 	return &api.ReplicationController{
-		TypeMeta: api.TypeMeta{
+		TypeMeta: unversioned.TypeMeta{
 			Kind:       "ReplicationController",
-			APIVersion: latest.Version,
+			APIVersion: registered.GroupOrDie(api.GroupName).GroupVersion.String(),
 		},
 		ObjectMeta: api.ObjectMeta{
 			Name: name,
@@ -223,7 +233,8 @@ func rcByNameContainer(name string, replicas int, image string, labels map[strin
 					Labels: labels,
 				},
 				Spec: api.PodSpec{
-					Containers: []api.Container{c},
+					Containers:                    []api.Container{c},
+					TerminationGracePeriodSeconds: &gracePeriod,
 				},
 			},
 		},
@@ -231,13 +242,13 @@ func rcByNameContainer(name string, replicas int, image string, labels map[strin
 }
 
 // newRCByName creates a replication controller with a selector by name of name.
-func newRCByName(c *client.Client, ns, name string, replicas int) (*api.ReplicationController, error) {
+func newRCByName(c *client.Client, ns, name string, replicas int32) (*api.ReplicationController, error) {
 	By(fmt.Sprintf("creating replication controller %s", name))
 	return c.ReplicationControllers(ns).Create(rcByNamePort(
-		name, replicas, serveHostnameImage, 9376, map[string]string{}))
+		name, replicas, serveHostnameImage, 9376, api.ProtocolTCP, map[string]string{}))
 }
 
-func resizeRC(c *client.Client, ns, name string, replicas int) error {
+func resizeRC(c *client.Client, ns, name string, replicas int32) error {
 	rc, err := c.ReplicationControllers(ns).Get(name)
 	if err != nil {
 		return err
@@ -247,60 +258,44 @@ func resizeRC(c *client.Client, ns, name string, replicas int) error {
 	return err
 }
 
-func podsCreated(c *client.Client, ns, name string, replicas int) (*api.PodList, error) {
-	// List the pods, making sure we observe all the replicas.
-	label := labels.SelectorFromSet(labels.Set(map[string]string{"name": name}))
-	for start := time.Now(); time.Since(start) < time.Minute; time.Sleep(5 * time.Second) {
-		pods, err := c.Pods(ns).List(label, fields.Everything())
+func getMaster(c *client.Client) string {
+	master := ""
+	switch framework.TestContext.Provider {
+	case "gce":
+		eps, err := c.Endpoints(api.NamespaceDefault).Get("kubernetes")
 		if err != nil {
-			return nil, err
+			framework.Failf("Fail to get kubernetes endpoinds: %v", err)
 		}
-
-		Logf("Pod name %s: Found %d pods out of %d", name, len(pods.Items), replicas)
-		if len(pods.Items) == replicas {
-			return pods, nil
+		if len(eps.Subsets) != 1 || len(eps.Subsets[0].Addresses) != 1 {
+			framework.Failf("There are more than 1 endpoints for kubernetes service: %+v", eps)
 		}
+		master = eps.Subsets[0].Addresses[0].IP
+	case "gke":
+		master = strings.TrimPrefix(framework.TestContext.Host, "https://")
+	case "aws":
+		// TODO(justinsb): Avoid hardcoding this.
+		master = "172.20.0.9"
+	default:
+		framework.Failf("This test is not supported for provider %s and should be disabled", framework.TestContext.Provider)
 	}
-	return nil, fmt.Errorf("Pod name %s: Gave up waiting for %d pods to come up", name, replicas)
+	return master
 }
 
-func podsRunning(c *client.Client, pods *api.PodList) []error {
-	// Wait for the pods to enter the running state. Waiting loops until the pods
-	// are running so non-running pods cause a timeout for this test.
-	By("ensuring each pod is running")
-	e := []error{}
-	for _, pod := range pods.Items {
-		// TODO: make waiting parallel.
-		err := waitForPodRunningInNamespace(c, pod.Name, pod.Namespace)
-		if err != nil {
-			e = append(e, err)
+// Return node external IP concatenated with port 22 for ssh
+// e.g. 1.2.3.4:22
+func getNodeExternalIP(node *api.Node) string {
+	framework.Logf("Getting external IP address for %s", node.Name)
+	host := ""
+	for _, a := range node.Status.Addresses {
+		if a.Type == api.NodeExternalIP {
+			host = a.Address + ":22"
+			break
 		}
 	}
-	return e
-}
-
-func podsResponding(c *client.Client, ns, name string, wantName bool, pods *api.PodList) error {
-	By("trying to dial each unique pod")
-	retryTimeout := 2 * time.Minute
-	retryInterval := 5 * time.Second
-	label := labels.SelectorFromSet(labels.Set(map[string]string{"name": name}))
-	return wait.Poll(retryInterval, retryTimeout, podResponseChecker{c, ns, label, name, wantName, pods}.checkAllResponses)
-}
-
-func verifyPods(c *client.Client, ns, name string, wantName bool, replicas int) error {
-	pods, err := podsCreated(c, ns, name, replicas)
-	if err != nil {
-		return err
+	if host == "" {
+		framework.Failf("Couldn't get the external IP of host %s with addresses %v", node.Name, node.Status.Addresses)
 	}
-	e := podsRunning(c, pods)
-	if len(e) > 0 {
-		return fmt.Errorf("failed to wait for pods running: %v", e)
-	}
-	err = podsResponding(c, ns, name, wantName, pods)
-	if err != nil {
-		return fmt.Errorf("failed to wait for pods responding: %v", err)
-	}
-	return nil
+	return host
 }
 
 // Blocks outgoing network traffic on 'node'. Then verifies that 'podNameToDisappear',
@@ -310,108 +305,91 @@ func verifyPods(c *client.Client, ns, name string, wantName bool, replicas int) 
 // At the end (even in case of errors), the network traffic is brought back to normal.
 // This function executes commands on a node so it will work only for some
 // environments.
-func performTemporaryNetworkFailure(c *client.Client, ns, rcName string, replicas int, podNameToDisappear string, node *api.Node) {
-	Logf("Getting external IP address for %s", node.Name)
-	host := ""
-	for _, a := range node.Status.Addresses {
-		if a.Type == api.NodeExternalIP {
-			host = a.Address + ":22"
-			break
-		}
-	}
-	if host == "" {
-		Failf("Couldn't get the external IP of host %s with addresses %v", node.Name, node.Status.Addresses)
-	}
+func performTemporaryNetworkFailure(c *client.Client, ns, rcName string, replicas int32, podNameToDisappear string, node *api.Node) {
+	host := getNodeExternalIP(node)
+	master := getMaster(c)
 	By(fmt.Sprintf("block network traffic from node %s to the master", node.Name))
-
-	// TODO marekbiskup 2015-06-19 #10085
-	// The use of MasterName will cause iptables to do a DNS lookup to
-	// resolve the name to an IP address, which will slow down the test
-	// and cause it to fail if DNS is absent or broken.
-	// Use the IP address instead.
-
-	iptablesRule := fmt.Sprintf("OUTPUT --destination %s --jump DROP", testContext.CloudConfig.MasterName)
 	defer func() {
 		// This code will execute even if setting the iptables rule failed.
 		// It is on purpose because we may have an error even if the new rule
 		// had been inserted. (yes, we could look at the error code and ssh error
 		// separately, but I prefer to stay on the safe side).
-
 		By(fmt.Sprintf("Unblock network traffic from node %s to the master", node.Name))
-		undropCmd := fmt.Sprintf("sudo iptables --delete %s", iptablesRule)
-		// Undrop command may fail if the rule has never been created.
-		// In such case we just lose 30 seconds, but the cluster is healthy.
-		// But if the rule had been created and removing it failed, the node is broken and
-		// not coming back. Subsequent tests will run or fewer nodes (some of the tests
-		// may fail). Manual intervention is required in such case (recreating the
-		// cluster solves the problem too).
-		err := wait.Poll(time.Millisecond*100, time.Second*30, func() (bool, error) {
-			_, _, code, err := SSH(undropCmd, host, testContext.Provider)
-			if code == 0 && err == nil {
-				return true, nil
-			} else {
-				Logf("Expected 0 exit code and nil error when running '%s' on %s, got %d and %v",
-					undropCmd, node.Name, code, err)
-				return false, nil
-			}
-		})
-		if err != nil {
-			Failf("Failed to remove the iptable DROP rule. Manual intervention is "+
-				"required on node %s: remove rule %s, if exists", node.Name, iptablesRule)
-		}
+		framework.UnblockNetwork(host, master)
 	}()
 
-	// The command will block all outgoing network traffic from the node to the master
-	// When multi-master is implemented, this test will have to be improved to block
-	// network traffic to all masters.
-	// We could also block network traffic from the master(s)s to this node,
-	// but blocking it one way is sufficient for this test.
-	dropCmd := fmt.Sprintf("sudo iptables --insert %s", iptablesRule)
-	if _, _, code, err := SSH(dropCmd, host, testContext.Provider); code != 0 || err != nil {
-		Failf("Expected 0 exit code and nil error when running %s on %s, got %d and %v",
-			dropCmd, node.Name, code, err)
+	framework.Logf("Waiting %v to ensure node %s is ready before beginning test...", resizeNodeReadyTimeout, node.Name)
+	if !framework.WaitForNodeToBe(c, node.Name, api.NodeReady, true, resizeNodeReadyTimeout) {
+		framework.Failf("Node %s did not become ready within %v", node.Name, resizeNodeReadyTimeout)
+	}
+	framework.BlockNetwork(host, master)
+
+	framework.Logf("Waiting %v for node %s to be not ready after simulated network failure", resizeNodeNotReadyTimeout, node.Name)
+	if !framework.WaitForNodeToBe(c, node.Name, api.NodeReady, false, resizeNodeNotReadyTimeout) {
+		framework.Failf("Node %s did not become not-ready within %v", node.Name, resizeNodeNotReadyTimeout)
 	}
 
-	Logf("Waiting for node %s to be not ready", node.Name)
-	waitForNodeToBe(c, node.Name, false, 2*time.Minute)
-
-	Logf("Waiting for pod %s to be removed", podNameToDisappear)
-	waitForRCPodToDisappear(c, ns, rcName, podNameToDisappear)
-
-	By("verifying whether the pod from the unreachable node is recreated")
-	err := verifyPods(c, ns, rcName, true, replicas)
+	framework.Logf("Waiting for pod %s to be removed", podNameToDisappear)
+	err := framework.WaitForRCPodToDisappear(c, ns, rcName, podNameToDisappear)
 	Expect(err).NotTo(HaveOccurred())
 
-	// network traffic is unblocked in a defered function
+	By("verifying whether the pod from the unreachable node is recreated")
+	err = framework.VerifyPods(c, ns, rcName, true, replicas)
+	Expect(err).NotTo(HaveOccurred())
+
+	// network traffic is unblocked in a deferred function
 }
 
-var _ = Describe("Nodes", func() {
+func expectNodeReadiness(isReady bool, newNode chan *api.Node) {
+	timeout := false
+	expected := false
+	timer := time.After(nodeReadinessTimeout)
+	for !expected && !timeout {
+		select {
+		case n := <-newNode:
+			if framework.IsNodeConditionSetAsExpected(n, api.NodeReady, isReady) {
+				expected = true
+			} else {
+				framework.Logf("Observed node ready status is NOT %v as expected", isReady)
+			}
+		case <-timer:
+			timeout = true
+		}
+	}
+	if !expected {
+		framework.Failf("Failed to observe node ready status change to %v", isReady)
+	}
+}
+
+var _ = framework.KubeDescribe("Nodes [Disruptive]", func() {
+	f := framework.NewDefaultFramework("resize-nodes")
+	var systemPodsNo int32
 	var c *client.Client
 	var ns string
+	ignoreLabels := framework.ImagePullerLabels
+	var group string
 
 	BeforeEach(func() {
-		var err error
-		c, err = loadClient()
-		expectNoError(err)
-		testingNs, err := createTestingNS("resize-nodes", c)
-		ns = testingNs.Name
+		c = f.Client
+		ns = f.Namespace.Name
+		systemPods, err := framework.GetPodsInNamespace(c, ns, ignoreLabels)
 		Expect(err).NotTo(HaveOccurred())
-	})
-
-	AfterEach(func() {
-		By(fmt.Sprintf("destroying namespace for this suite %s", ns))
-		if err := c.Namespaces().Delete(ns); err != nil {
-			Failf("Couldn't delete namespace '%s', %v", ns, err)
+		systemPodsNo = int32(len(systemPods))
+		if strings.Index(framework.TestContext.CloudConfig.NodeInstanceGroup, ",") >= 0 {
+			framework.Failf("Test dose not support cluster setup with more than one MIG: %s", framework.TestContext.CloudConfig.NodeInstanceGroup)
+		} else {
+			group = framework.TestContext.CloudConfig.NodeInstanceGroup
 		}
 	})
 
-	Describe("Resize", func() {
+	// Slow issue #13323 (8 min)
+	framework.KubeDescribe("Resize [Slow]", func() {
 		var skipped bool
 
 		BeforeEach(func() {
 			skipped = true
-			SkipUnlessProviderIs("gce", "gke", "aws")
-			SkipUnlessNodeCountIsAtLeast(2)
+			framework.SkipUnlessProviderIs("gce", "gke", "aws")
+			framework.SkipUnlessNodeCountIsAtLeast(2)
 			skipped = false
 		})
 
@@ -421,71 +399,90 @@ var _ = Describe("Nodes", func() {
 			}
 
 			By("restoring the original node instance group size")
-			if err := resizeGroup(testContext.CloudConfig.NumNodes); err != nil {
-				Failf("Couldn't restore the original node instance group size: %v", err)
+			if err := ResizeGroup(group, int32(framework.TestContext.CloudConfig.NumNodes)); err != nil {
+				framework.Failf("Couldn't restore the original node instance group size: %v", err)
 			}
-			if err := waitForGroupSize(testContext.CloudConfig.NumNodes); err != nil {
-				Failf("Couldn't restore the original node instance group size: %v", err)
+			// In GKE, our current tunneling setup has the potential to hold on to a broken tunnel (from a
+			// rebooted/deleted node) for up to 5 minutes before all tunnels are dropped and recreated.
+			// Most tests make use of some proxy feature to verify functionality. So, if a reboot test runs
+			// right before a test that tries to get logs, for example, we may get unlucky and try to use a
+			// closed tunnel to a node that was recently rebooted. There's no good way to framework.Poll for proxies
+			// being closed, so we sleep.
+			//
+			// TODO(cjcullen) reduce this sleep (#19314)
+			if framework.ProviderIs("gke") {
+				By("waiting 5 minutes for all dead tunnels to be dropped")
+				time.Sleep(5 * time.Minute)
 			}
-			if err := waitForClusterSize(c, testContext.CloudConfig.NumNodes); err != nil {
-				Failf("Couldn't restore the original cluster size: %v", err)
+			if err := WaitForGroupSize(group, int32(framework.TestContext.CloudConfig.NumNodes)); err != nil {
+				framework.Failf("Couldn't restore the original node instance group size: %v", err)
 			}
+			if err := framework.WaitForClusterSize(c, framework.TestContext.CloudConfig.NumNodes, 10*time.Minute); err != nil {
+				framework.Failf("Couldn't restore the original cluster size: %v", err)
+			}
+			// Many e2e tests assume that the cluster is fully healthy before they start.  Wait until
+			// the cluster is restored to health.
+			By("waiting for system pods to successfully restart")
+			err := framework.WaitForPodsRunningReady(c, api.NamespaceSystem, systemPodsNo, framework.PodReadyBeforeTimeout, ignoreLabels)
+			Expect(err).NotTo(HaveOccurred())
+			By("waiting for image prepulling pods to complete")
+			framework.WaitForPodsSuccess(c, api.NamespaceSystem, framework.ImagePullerLabels, imagePrePullingTimeout)
 		})
 
 		It("should be able to delete nodes", func() {
 			// Create a replication controller for a service that serves its hostname.
-			// The source for the Docker containter kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
+			// The source for the Docker container kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
 			name := "my-hostname-delete-node"
-			replicas := testContext.CloudConfig.NumNodes
+			replicas := int32(framework.TestContext.CloudConfig.NumNodes)
 			newRCByName(c, ns, name, replicas)
-			err := verifyPods(c, ns, name, true, replicas)
+			err := framework.VerifyPods(c, ns, name, true, replicas)
 			Expect(err).NotTo(HaveOccurred())
 
 			By(fmt.Sprintf("decreasing cluster size to %d", replicas-1))
-			err = resizeGroup(replicas - 1)
+			err = ResizeGroup(group, replicas-1)
 			Expect(err).NotTo(HaveOccurred())
-			err = waitForGroupSize(replicas - 1)
+			err = WaitForGroupSize(group, replicas-1)
 			Expect(err).NotTo(HaveOccurred())
-			err = waitForClusterSize(c, replicas-1)
+			err = framework.WaitForClusterSize(c, int(replicas-1), 10*time.Minute)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("verifying whether the pods from the removed node are recreated")
-			err = verifyPods(c, ns, name, true, replicas)
+			err = framework.VerifyPods(c, ns, name, true, replicas)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
 		// TODO: Bug here - testName is not correct
 		It("should be able to add nodes", func() {
 			// Create a replication controller for a service that serves its hostname.
-			// The source for the Docker containter kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
+			// The source for the Docker container kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
 			name := "my-hostname-add-node"
 			newSVCByName(c, ns, name)
-			replicas := testContext.CloudConfig.NumNodes
+			replicas := int32(framework.TestContext.CloudConfig.NumNodes)
 			newRCByName(c, ns, name, replicas)
-			err := verifyPods(c, ns, name, true, replicas)
+			err := framework.VerifyPods(c, ns, name, true, replicas)
 			Expect(err).NotTo(HaveOccurred())
 
 			By(fmt.Sprintf("increasing cluster size to %d", replicas+1))
-			err = resizeGroup(replicas + 1)
+			err = ResizeGroup(group, replicas+1)
 			Expect(err).NotTo(HaveOccurred())
-			err = waitForGroupSize(replicas + 1)
+			err = WaitForGroupSize(group, replicas+1)
 			Expect(err).NotTo(HaveOccurred())
-			err = waitForClusterSize(c, replicas+1)
+			err = framework.WaitForClusterSize(c, int(replicas+1), 10*time.Minute)
 			Expect(err).NotTo(HaveOccurred())
 
 			By(fmt.Sprintf("increasing size of the replication controller to %d and verifying all pods are running", replicas+1))
 			err = resizeRC(c, ns, name, replicas+1)
 			Expect(err).NotTo(HaveOccurred())
-			err = verifyPods(c, ns, name, true, replicas+1)
+			err = framework.VerifyPods(c, ns, name, true, replicas+1)
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
-	Describe("Network", func() {
-		Context("when a minion node becomes unreachable", func() {
+	framework.KubeDescribe("Network", func() {
+		Context("when a node becomes unreachable", func() {
 			BeforeEach(func() {
-				SkipUnlessProviderIs("gce", "gke", "aws")
-				SkipUnlessNodeCountIsAtLeast(2)
+				framework.SkipUnlessProviderIs("gce", "gke", "aws")
+				framework.SkipUnlessNodeCountIsAtLeast(2)
 			})
 
 			// TODO marekbiskup 2015-06-19 #10085
@@ -494,21 +491,22 @@ var _ = Describe("Nodes", func() {
 			// 1. pods from a uncontactable nodes are rescheduled
 			// 2. when a node joins the cluster, it can host new pods.
 			// Factor out the cases into two separate tests.
-			It("[replication controller] recreates pods scheduled on the unreachable minion node "+
-				"AND allows scheduling of pods on a minion after it rejoins the cluster", func() {
+			It("[replication controller] recreates pods scheduled on the unreachable node "+
+				"AND allows scheduling of pods on a node after it rejoins the cluster", func() {
 
 				// Create a replication controller for a service that serves its hostname.
-				// The source for the Docker containter kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
+				// The source for the Docker container kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
 				name := "my-hostname-net"
 				newSVCByName(c, ns, name)
-				replicas := testContext.CloudConfig.NumNodes
+				replicas := int32(framework.TestContext.CloudConfig.NumNodes)
 				newRCByName(c, ns, name, replicas)
-				err := verifyPods(c, ns, name, true, replicas)
+				err := framework.VerifyPods(c, ns, name, true, replicas)
 				Expect(err).NotTo(HaveOccurred(), "Each pod should start running and responding")
 
 				By("choose a node with at least one pod - we will block some network traffic on this node")
 				label := labels.SelectorFromSet(labels.Set(map[string]string{"name": name}))
-				pods, err := c.Pods(ns).List(label, fields.Everything()) // list pods after all have been scheduled
+				options := api.ListOptions{LabelSelector: label}
+				pods, err := c.Pods(ns).List(options) // list pods after all have been scheduled
 				Expect(err).NotTo(HaveOccurred())
 				nodeName := pods.Items[0].Spec.NodeName
 
@@ -517,16 +515,21 @@ var _ = Describe("Nodes", func() {
 
 				By(fmt.Sprintf("block network traffic from node %s", node.Name))
 				performTemporaryNetworkFailure(c, ns, name, replicas, pods.Items[0].Name, node)
-				Logf("Waiting for node %s to be ready", node.Name)
-				waitForNodeToBe(c, node.Name, true, 2*time.Minute)
+				framework.Logf("Waiting %v for node %s to be ready once temporary network failure ends", resizeNodeReadyTimeout, node.Name)
+				if !framework.WaitForNodeToBeReady(c, node.Name, resizeNodeReadyTimeout) {
+					framework.Failf("Node %s did not become ready within %v", node.Name, resizeNodeReadyTimeout)
+				}
 
-				By("verify wheter new pods can be created on the re-attached node")
+				// sleep a bit, to allow Watch in NodeController to catch up.
+				time.Sleep(5 * time.Second)
+
+				By("verify whether new pods can be created on the re-attached node")
 				// increasing the RC size is not a valid way to test this
 				// since we have no guarantees the pod will be scheduled on our node.
 				additionalPod := "additionalpod"
 				err = newPodOnNode(c, ns, additionalPod, node.Name)
 				Expect(err).NotTo(HaveOccurred())
-				err = verifyPods(c, ns, additionalPod, true, 1)
+				err = framework.VerifyPods(c, ns, additionalPod, true, 1)
 				Expect(err).NotTo(HaveOccurred())
 
 				// verify that it is really on the requested node
@@ -534,8 +537,103 @@ var _ = Describe("Nodes", func() {
 					pod, err := c.Pods(ns).Get(additionalPod)
 					Expect(err).NotTo(HaveOccurred())
 					if pod.Spec.NodeName != node.Name {
-						Logf("Pod %s found on invalid node: %s instead of %s", pod.Spec.NodeName, node.Name)
+						framework.Logf("Pod %s found on invalid node: %s instead of %s", pod.Name, pod.Spec.NodeName, node.Name)
 					}
+				}
+			})
+
+			// What happens in this test:
+			// 	Network traffic from a node to master is cut off to simulate network partition
+			// Expect to observe:
+			// 1. Node is marked NotReady after timeout by nodecontroller (40seconds)
+			// 2. All pods on node are marked NotReady shortly after #1
+			// 3. Node and pods return to Ready after connectivivty recovers
+			It("All pods on the unreachable node should be marked as NotReady upon the node turn NotReady "+
+				"AND all pods should be mark back to Ready when the node get back to Ready before pod eviction timeout", func() {
+				By("choose a node - we will block all network traffic on this node")
+				var podOpts api.ListOptions
+				nodeOpts := api.ListOptions{}
+				nodes, err := c.Nodes().List(nodeOpts)
+				Expect(err).NotTo(HaveOccurred())
+				framework.FilterNodes(nodes, func(node api.Node) bool {
+					if !framework.IsNodeConditionSetAsExpected(&node, api.NodeReady, true) {
+						return false
+					}
+					podOpts = api.ListOptions{FieldSelector: fields.OneTermEqualSelector(api.PodHostField, node.Name)}
+					pods, err := c.Pods(api.NamespaceAll).List(podOpts)
+					if err != nil || len(pods.Items) <= 0 {
+						return false
+					}
+					return true
+				})
+				if len(nodes.Items) <= 0 {
+					framework.Failf("No eligible node were found: %d", len(nodes.Items))
+				}
+				node := nodes.Items[0]
+				podOpts = api.ListOptions{FieldSelector: fields.OneTermEqualSelector(api.PodHostField, node.Name)}
+				if err = framework.WaitForMatchPodsCondition(c, podOpts, "Running and Ready", podReadyTimeout, framework.PodRunningReady); err != nil {
+					framework.Failf("Pods on node %s are not ready and running within %v: %v", node.Name, podReadyTimeout, err)
+				}
+
+				By("Set up watch on node status")
+				nodeSelector := fields.OneTermEqualSelector("metadata.name", node.Name)
+				stopCh := make(chan struct{})
+				newNode := make(chan *api.Node)
+				var controller *cache.Controller
+				_, controller = cache.NewInformer(
+					&cache.ListWatch{
+						ListFunc: func(options api.ListOptions) (runtime.Object, error) {
+							options.FieldSelector = nodeSelector
+							return f.Client.Nodes().List(options)
+						},
+						WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
+							options.FieldSelector = nodeSelector
+							return f.Client.Nodes().Watch(options)
+						},
+					},
+					&api.Node{},
+					0,
+					cache.ResourceEventHandlerFuncs{
+						UpdateFunc: func(oldObj, newObj interface{}) {
+							n, ok := newObj.(*api.Node)
+							Expect(ok).To(Equal(true))
+							newNode <- n
+
+						},
+					},
+				)
+
+				defer func() {
+					// Will not explicitly close newNode channel here due to
+					// race condition where stopCh and newNode are closed but informer onUpdate still executes.
+					close(stopCh)
+				}()
+				go controller.Run(stopCh)
+
+				By(fmt.Sprintf("Block traffic from node %s to the master", node.Name))
+				host := getNodeExternalIP(&node)
+				master := getMaster(c)
+				defer func() {
+					By(fmt.Sprintf("Unblock traffic from node %s to the master", node.Name))
+					framework.UnblockNetwork(host, master)
+
+					if CurrentGinkgoTestDescription().Failed {
+						return
+					}
+
+					By("Expect to observe node and pod status change from NotReady to Ready after network connectivity recovers")
+					expectNodeReadiness(true, newNode)
+					if err = framework.WaitForMatchPodsCondition(c, podOpts, "Running and Ready", podReadyTimeout, framework.PodRunningReady); err != nil {
+						framework.Failf("Pods on node %s did not become ready and running within %v: %v", node.Name, podReadyTimeout, err)
+					}
+				}()
+
+				framework.BlockNetwork(host, master)
+
+				By("Expect to observe node and pod status change from Ready to NotReady after network partition")
+				expectNodeReadiness(false, newNode)
+				if err = framework.WaitForMatchPodsCondition(c, podOpts, "NotReady", podNotReadyTimeout, framework.PodNotReady); err != nil {
+					framework.Failf("Pods on node %s did not become NotReady within %v: %v", node.Name, podNotReadyTimeout, err)
 				}
 			})
 		})

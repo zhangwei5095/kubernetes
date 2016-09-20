@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,15 @@ limitations under the License.
 // an alternate platform, we will need to abstract further.
 package mount
 
-import "github.com/golang/glog"
+import (
+	"fmt"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/util/exec"
+)
 
 type Interface interface {
 	// Mount mounts source to target as fstype with given options.
@@ -30,9 +38,22 @@ type Interface interface {
 	// it could change between chunked reads). This is guaranteed to be
 	// consistent.
 	List() ([]MountPoint, error)
-	// IsMountPoint determines if a directory is a mountpoint.
-	IsMountPoint(file string) (bool, error)
+	// IsLikelyNotMountPoint determines if a directory is a mountpoint.
+	// It should return ErrNotExist when the directory does not exist.
+	IsLikelyNotMountPoint(file string) (bool, error)
+	// DeviceOpened determines if the device is in use elsewhere
+	// on the system, i.e. still mounted.
+	DeviceOpened(pathname string) (bool, error)
+	// PathIsDevice determines if a path is a device.
+	PathIsDevice(pathname string) (bool, error)
+	// GetDeviceNameFromMount finds the device name by checking the mount path
+	// to get the global mount path which matches its plugin directory
+	GetDeviceNameFromMount(mountPath, pluginDir string) (string, error)
 }
+
+// Compile-time check to ensure all Mounter implementations satisfy
+// the mount interface
+var _ Interface = &Mounter{}
 
 // This represents a single line in /proc/mounts or /etc/fstab.
 type MountPoint struct {
@@ -42,6 +63,29 @@ type MountPoint struct {
 	Opts   []string
 	Freq   int
 	Pass   int
+}
+
+// SafeFormatAndMount probes a device to see if it is formatted.
+// Namely it checks to see if a file system is present. If so it
+// mounts it otherwise the device is formatted first then mounted.
+type SafeFormatAndMount struct {
+	Interface
+	Runner exec.Interface
+}
+
+// FormatAndMount formats the given disk, if needed, and mounts it.
+// That is if the disk is not formatted and it is not being mounted as
+// read-only it will format it first then mount it. Otherwise, if the
+// disk is already formatted or it is being mounted as read-only, it
+// will be mounted without formatting.
+func (mounter *SafeFormatAndMount) FormatAndMount(source string, target string, fstype string, options []string) error {
+	// Don't attempt to format if mounting as readonly. Go straight to mounting.
+	for _, option := range options {
+		if option == "ro" {
+			return mounter.Interface.Mount(source, target, fstype, options)
+		}
+	}
+	return mounter.formatAndMount(source, target, fstype, options)
 }
 
 // New returns a mount.Interface for the current system.
@@ -59,8 +103,13 @@ func GetMountRefs(mounter Interface, mountPath string) ([]string, error) {
 
 	// Find the device name.
 	deviceName := ""
+	// If mountPath is symlink, need get its target path.
+	slTarget, err := filepath.EvalSymlinks(mountPath)
+	if err != nil {
+		slTarget = mountPath
+	}
 	for i := range mps {
-		if mps[i].Path == mountPath {
+		if mps[i].Path == slTarget {
 			deviceName = mps[i].Device
 			break
 		}
@@ -72,7 +121,7 @@ func GetMountRefs(mounter Interface, mountPath string) ([]string, error) {
 		glog.Warningf("could not determine device for path: %q", mountPath)
 	} else {
 		for i := range mps {
-			if mps[i].Device == deviceName && mps[i].Path != mountPath {
+			if mps[i].Device == deviceName && mps[i].Path != slTarget {
 				refs = append(refs, mps[i].Path)
 			}
 		}
@@ -91,8 +140,13 @@ func GetDeviceNameFromMount(mounter Interface, mountPath string) (string, int, e
 	// Find the device name.
 	// FIXME if multiple devices mounted on the same mount path, only the first one is returned
 	device := ""
+	// If mountPath is symlink, need get its target path.
+	slTarget, err := filepath.EvalSymlinks(mountPath)
+	if err != nil {
+		slTarget = mountPath
+	}
 	for i := range mps {
-		if mps[i].Path == mountPath {
+		if mps[i].Path == slTarget {
 			device = mps[i].Device
 			break
 		}
@@ -106,4 +160,26 @@ func GetDeviceNameFromMount(mounter Interface, mountPath string) (string, int, e
 		}
 	}
 	return device, refCount, nil
+}
+
+// getDeviceNameFromMount find the device name from /proc/mounts in which
+// the mount path reference should match the given plugin directory. In case no mount path reference
+// matches, returns the volume name taken from its given mountPath
+func getDeviceNameFromMount(mounter Interface, mountPath, pluginDir string) (string, error) {
+	refs, err := GetMountRefs(mounter, mountPath)
+	if err != nil {
+		glog.V(4).Infof("GetMountRefs failed for mount path %q: %v", mountPath, err)
+		return "", err
+	}
+	if len(refs) == 0 {
+		glog.V(4).Infof("Directory %s is not mounted", mountPath)
+		return "", fmt.Errorf("directory %s is not mounted", mountPath)
+	}
+	for _, ref := range refs {
+		if strings.HasPrefix(ref, pluginDir) {
+			return path.Base(ref), nil
+		}
+	}
+
+	return path.Base(mountPath), nil
 }

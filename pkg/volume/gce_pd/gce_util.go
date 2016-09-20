@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,19 +18,18 @@ package gce_pd
 
 import (
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/gce"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/exec"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/mount"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/operationmanager"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/cloudprovider"
+	gcecloud "k8s.io/kubernetes/pkg/cloudprovider/providers/gce"
+	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/volume"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 )
 
 const (
@@ -40,220 +39,168 @@ const (
 	diskPartitionSuffix  = "-part"
 	diskSDPath           = "/dev/sd"
 	diskSDPattern        = "/dev/sd*"
-	maxChecks            = 10
+	maxChecks            = 60
 	maxRetries           = 10
 	checkSleepDuration   = time.Second
 )
 
-// Singleton operation manager for managing detach clean up go routines
-var detachCleanupManager = operationmanager.NewOperationManager()
+// These variables are modified only in unit tests and should be constant
+// otherwise.
+var (
+	errorSleepDuration time.Duration = 5 * time.Second
+)
 
 type GCEDiskUtil struct{}
 
-// Attaches a disk specified by a volume.GCEPersistentDisk to the current kubelet.
-// Mounts the disk to it's global path.
-func (diskUtil *GCEDiskUtil) AttachAndMountDisk(pd *gcePersistentDisk, globalPDPath string) error {
-	glog.V(5).Infof("AttachAndMountDisk(pd, %q) where pd is %#v\r\n", globalPDPath, pd)
-	// Terminate any in progress verify detach go routines, this will block until the goroutine is ready to exit because the channel is unbuffered
-	detachCleanupManager.Send(pd.pdName, true)
-	sdBefore, err := filepath.Glob(diskSDPattern)
-	if err != nil {
-		glog.Errorf("Error filepath.Glob(\"%s\"): %v\r\n", diskSDPattern, err)
-	}
-	sdBeforeSet := util.NewStringSet(sdBefore...)
-
-	gce, err := cloudprovider.GetCloudProvider("gce", nil)
+func (util *GCEDiskUtil) DeleteVolume(d *gcePersistentDiskDeleter) error {
+	cloud, err := getCloudProvider(d.gcePersistentDisk.plugin.host.GetCloudProvider())
 	if err != nil {
 		return err
 	}
 
-	if err := gce.(*gce_cloud.GCECloud).AttachDisk(pd.pdName, pd.readOnly); err != nil {
+	if err = cloud.DeleteDisk(d.pdName); err != nil {
+		glog.V(2).Infof("Error deleting GCE PD volume %s: %v", d.pdName, err)
 		return err
 	}
+	glog.V(2).Infof("Successfully deleted GCE PD volume %s", d.pdName)
+	return nil
+}
 
-	devicePath, err := verifyAttached(pd, sdBeforeSet, gce)
+// CreateVolume creates a GCE PD.
+// Returns: volumeID, volumeSizeGB, labels, error
+func (gceutil *GCEDiskUtil) CreateVolume(c *gcePersistentDiskProvisioner) (string, int, map[string]string, error) {
+	cloud, err := getCloudProvider(c.gcePersistentDisk.plugin.host.GetCloudProvider())
 	if err != nil {
-		return err
+		return "", 0, nil, err
 	}
 
-	// Only mount the PD globally once.
-	mountpoint, err := pd.mounter.IsMountPoint(globalPDPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(globalPDPath, 0750); err != nil {
-				return err
-			}
-			mountpoint = false
-		} else {
-			return err
+	name := volume.GenerateVolumeName(c.options.ClusterName, c.options.PVName, 63) // GCE PD name can have up to 63 characters
+	requestBytes := c.options.Capacity.Value()
+	// GCE works with gigabytes, convert to GiB with rounding up
+	requestGB := volume.RoundUpSize(requestBytes, 1024*1024*1024)
+
+	// Apply Parameters (case-insensitive). We leave validation of
+	// the values to the cloud provider.
+	diskType := ""
+	zone := ""
+	for k, v := range c.options.Parameters {
+		switch strings.ToLower(k) {
+		case "type":
+			diskType = v
+		case "zone":
+			zone = v
+		default:
+			return "", 0, nil, fmt.Errorf("invalid option %q for volume plugin %s", k, c.plugin.GetPluginName())
 		}
 	}
-	options := []string{}
-	if pd.readOnly {
-		options = append(options, "ro")
+
+	// TODO: implement c.options.ProvisionerSelector parsing
+	if c.options.Selector != nil {
+		return "", 0, nil, fmt.Errorf("claim.Spec.Selector is not supported for dynamic provisioning on GCE")
 	}
-	if !mountpoint {
-		err = pd.diskMounter.Mount(devicePath, globalPDPath, pd.fsType, options)
+
+	if zone == "" {
+		// No zone specified, choose one randomly in the same region as the
+		// node is running.
+		zones, err := cloud.GetAllZones()
 		if err != nil {
-			os.Remove(globalPDPath)
-			return err
+			glog.V(2).Infof("error getting zone information from GCE: %v", err)
+			return "", 0, nil, err
 		}
+		zone = volume.ChooseZoneForVolume(zones, c.options.PVCName)
 	}
-	return nil
-}
 
-// Unmounts the device and detaches the disk from the kubelet's host machine.
-func (util *GCEDiskUtil) DetachDisk(pd *gcePersistentDisk) error {
-	// Unmount the global PD mount, which should be the only one.
-	globalPDPath := makeGlobalPDName(pd.plugin.host, pd.pdName)
-	glog.V(5).Infof("DetachDisk(pd) where pd is %#v and the globalPDPath is %q\r\n", pd, globalPDPath)
-
-	// Terminate any in progress verify detach go routines, this will block until the goroutine is ready to exit because the channel is unbuffered
-	detachCleanupManager.Send(pd.pdName, true)
-
-	if err := pd.mounter.Unmount(globalPDPath); err != nil {
-		return err
-	}
-	if err := os.Remove(globalPDPath); err != nil {
-		return err
-	}
-	// Detach the disk
-	gce, err := cloudprovider.GetCloudProvider("gce", nil)
+	err = cloud.CreateDisk(name, diskType, zone, int64(requestGB), *c.options.CloudTags)
 	if err != nil {
-		return err
+		glog.V(2).Infof("Error creating GCE PD volume: %v", err)
+		return "", 0, nil, err
 	}
-	if err := gce.(*gce_cloud.GCECloud).DetachDisk(pd.pdName); err != nil {
-		return err
-	}
+	glog.V(2).Infof("Successfully created GCE PD volume %s", name)
 
-	// Verify disk detached, retry if needed.
-	go verifyDetached(pd, gce)
-	return nil
-}
-
-// Verifys the disk device to be created has been succesffully attached, and retries if it fails.
-func verifyAttached(pd *gcePersistentDisk, sdBeforeSet util.StringSet, gce cloudprovider.Interface) (string, error) {
-	devicePaths := getDiskByIdPaths(pd)
-	for numRetries := 0; numRetries < maxRetries; numRetries++ {
-		for numChecks := 0; numChecks < maxChecks; numChecks++ {
-			if err := udevadmChangeToNewDrives(sdBeforeSet); err != nil {
-				// udevadm errors should not block disk attachment, log and continue
-				glog.Errorf("%v", err)
-			}
-
-			for _, path := range devicePaths {
-				if pathExists, err := pathExists(path); err != nil {
-					return "", err
-				} else if pathExists {
-					// A device path has succesfully been created for the PD
-					glog.V(5).Infof("Succesfully attached GCE PD %q.", pd.pdName)
-					return path, nil
-				}
-			}
-
-			// Sleep then check again
-			glog.V(5).Infof("Waiting for GCE PD %q to attach.", pd.pdName)
-			time.Sleep(checkSleepDuration)
-		}
-
-		// Try attaching the disk again
-		glog.Warningf("Timed out waiting for GCE PD %q to attach. Retrying attach.", pd.pdName)
-		if err := gce.(*gce_cloud.GCECloud).AttachDisk(pd.pdName, pd.readOnly); err != nil {
-			return "", err
-		}
-	}
-
-	return "", fmt.Errorf("Could not attach GCE PD %q. Timeout waiting for mount paths to be created.", pd.pdName)
-}
-
-// Veify the specified persistent disk device has been succesfully detached, and retries if it fails.
-// This function is intended to be called asynchronously as a go routine.
-func verifyDetached(pd *gcePersistentDisk, gce cloudprovider.Interface) {
-	defer util.HandleCrash()
-
-	// Setting bufferSize to 0 so that when senders send, they are blocked until we recieve. This avoids the need to have a separate exit check.
-	ch, err := detachCleanupManager.Start(pd.pdName, 0 /* bufferSize */)
+	labels, err := cloud.GetAutoLabelsForPD(name, zone)
 	if err != nil {
-		glog.Errorf("Error adding %q to detachCleanupManager: %v", pd.pdName, err)
-		return
+		// We don't really want to leak the volume here...
+		glog.Errorf("error getting labels for volume %q: %v", name, err)
 	}
-	defer detachCleanupManager.Close(pd.pdName)
 
-	devicePaths := getDiskByIdPaths(pd)
-	for numRetries := 0; numRetries < maxRetries; numRetries++ {
-		for numChecks := 0; numChecks < maxChecks; numChecks++ {
-			select {
-			case <-ch:
-				glog.Warningf("Terminating GCE PD %q detach verification. Another attach/detach call was made for this PD.", pd.pdName)
-				return
-			default:
-				allPathsRemoved := true
-				for _, path := range devicePaths {
-					if err := udevadmChangeToDrive(path); err != nil {
-						// udevadm errors should not block disk detachment, log and continue
-						glog.Errorf("%v", err)
-					}
-					if exists, err := pathExists(path); err != nil {
-						glog.Errorf("Error check path: %v", err)
-						return
-					} else {
-						allPathsRemoved = allPathsRemoved && !exists
-					}
-				}
-				if allPathsRemoved {
-					// All paths to the PD have been succefully removed
-					glog.V(5).Infof("Succesfully detached GCE PD %q.", pd.pdName)
-					return
-				}
+	return name, int(requestGB), labels, nil
+}
 
-				// Sleep then check again
-				glog.V(5).Infof("Waiting for GCE PD %q to detach.", pd.pdName)
-				time.Sleep(checkSleepDuration)
-			}
-		}
+// Returns the first path that exists, or empty string if none exist.
+func verifyDevicePath(devicePaths []string, sdBeforeSet sets.String) (string, error) {
+	if err := udevadmChangeToNewDrives(sdBeforeSet); err != nil {
+		// udevadm errors should not block disk detachment, log and continue
+		glog.Errorf("udevadmChangeToNewDrives failed with: %v", err)
+	}
 
-		// Try detaching disk again
-		glog.Warningf("Timed out waiting for GCE PD %q to detach. Retrying detach.", pd.pdName)
-		if err := gce.(*gce_cloud.GCECloud).DetachDisk(pd.pdName); err != nil {
-			glog.Errorf("Error on retry detach PD %q: %v", pd.pdName, err)
-			return
+	for _, path := range devicePaths {
+		if pathExists, err := volumeutil.PathExists(path); err != nil {
+			return "", fmt.Errorf("Error checking if path exists: %v", err)
+		} else if pathExists {
+			return path, nil
 		}
 	}
 
-	glog.Errorf("Could not detach GCE PD %q. One or more mount paths was not removed.", pd.pdName)
+	return "", nil
+}
+
+// Returns the first path that exists, or empty string if none exist.
+func verifyAllPathsRemoved(devicePaths []string) (bool, error) {
+	allPathsRemoved := true
+	for _, path := range devicePaths {
+		if err := udevadmChangeToDrive(path); err != nil {
+			// udevadm errors should not block disk detachment, log and continue
+			glog.Errorf("%v", err)
+		}
+		if exists, err := volumeutil.PathExists(path); err != nil {
+			return false, fmt.Errorf("Error checking if path exists: %v", err)
+		} else {
+			allPathsRemoved = allPathsRemoved && !exists
+		}
+	}
+
+	return allPathsRemoved, nil
 }
 
 // Returns list of all /dev/disk/by-id/* paths for given PD.
-func getDiskByIdPaths(pd *gcePersistentDisk) []string {
+func getDiskByIdPaths(pdName string, partition string) []string {
 	devicePaths := []string{
-		path.Join(diskByIdPath, diskGooglePrefix+pd.pdName),
-		path.Join(diskByIdPath, diskScsiGooglePrefix+pd.pdName),
+		path.Join(diskByIdPath, diskGooglePrefix+pdName),
+		path.Join(diskByIdPath, diskScsiGooglePrefix+pdName),
 	}
 
-	if pd.partition != "" {
+	if partition != "" {
 		for i, path := range devicePaths {
-			devicePaths[i] = path + diskPartitionSuffix + pd.partition
+			devicePaths[i] = path + diskPartitionSuffix + partition
 		}
 	}
 
 	return devicePaths
 }
 
-// Checks if the specified path exists
-func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	} else if os.IsNotExist(err) {
-		return false, nil
-	} else {
-		return false, err
+// Return cloud provider
+func getCloudProvider(cloudProvider cloudprovider.Interface) (*gcecloud.GCECloud, error) {
+	var err error
+	for numRetries := 0; numRetries < maxRetries; numRetries++ {
+		gceCloudProvider, ok := cloudProvider.(*gcecloud.GCECloud)
+		if !ok || gceCloudProvider == nil {
+			// Retry on error. See issue #11321
+			glog.Errorf("Failed to get GCE Cloud Provider. plugin.host.GetCloudProvider returned %v instead", cloudProvider)
+			time.Sleep(errorSleepDuration)
+			continue
+		}
+
+		return gceCloudProvider, nil
 	}
+
+	return nil, fmt.Errorf("Failed to get GCE GCECloudProvider with error %v", err)
 }
 
-// Calls "udevadm trigger --action=change" for newly created "/dev/sd*" drives (exist only in after set).
-// This is workaround for Issue #7972. Once the underlying issue has been resolved, this may be removed.
-func udevadmChangeToNewDrives(sdBeforeSet util.StringSet) error {
+// Triggers the application of udev rules by calling "udevadm trigger
+// --action=change" for newly created "/dev/sd*" drives (exist only in
+// after set). This is workaround for Issue #7972. Once the underlying
+// issue has been resolved, this may be removed.
+func udevadmChangeToNewDrives(sdBeforeSet sets.String) error {
 	sdAfter, err := filepath.Glob(diskSDPattern)
 	if err != nil {
 		return fmt.Errorf("Error filepath.Glob(\"%s\"): %v\r\n", diskSDPattern, err)
@@ -296,37 +243,4 @@ func udevadmChangeToDrive(drivePath string) error {
 		return fmt.Errorf("udevadmChangeToDrive: udevadm trigger failed for drive %q with %v.", drive, err)
 	}
 	return nil
-}
-
-// safe_format_and_mount is a utility script on GCE VMs that probes a persistent disk, and if
-// necessary formats it before mounting it.
-// This eliminates the necesisty to format a PD before it is used with a Pod on GCE.
-// TODO: port this script into Go and use it for all Linux platforms
-type gceSafeFormatAndMount struct {
-	mount.Interface
-	runner exec.Interface
-}
-
-// uses /usr/share/google/safe_format_and_mount to optionally mount, and format a disk
-func (mounter *gceSafeFormatAndMount) Mount(source string, target string, fstype string, options []string) error {
-	// Don't attempt to format if mounting as readonly. Go straight to mounting.
-	for _, option := range options {
-		if option == "ro" {
-			return mounter.Interface.Mount(source, target, fstype, options)
-		}
-	}
-	args := []string{}
-	// ext4 is the default for safe_format_and_mount
-	if len(fstype) > 0 && fstype != "ext4" {
-		args = append(args, "-m", fmt.Sprintf("mkfs.%s", fstype))
-	}
-	args = append(args, options...)
-	args = append(args, source, target)
-	glog.V(5).Infof("exec-ing: /usr/share/google/safe_format_and_mount %v", args)
-	cmd := mounter.runner.Command("/usr/share/google/safe_format_and_mount", args...)
-	dataOut, err := cmd.CombinedOutput()
-	if err != nil {
-		glog.V(5).Infof("error running /usr/share/google/safe_format_and_mount\n%s", string(dataOut))
-	}
-	return err
 }

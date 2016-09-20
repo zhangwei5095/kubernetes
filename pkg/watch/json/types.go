@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/watch"
 )
 
 // WatchEvent objects are streamed from the api server in response to a watch request.
@@ -40,14 +40,14 @@ type WatchEvent struct {
 }
 
 // Object converts a watch.Event into an appropriately serializable JSON object
-func Object(codec runtime.Codec, event *watch.Event) (interface{}, error) {
+func Object(encoder runtime.Encoder, event *watch.Event) (interface{}, error) {
 	obj, ok := event.Object.(runtime.Object)
 	if !ok {
 		return nil, fmt.Errorf("the event object cannot be safely converted to JSON: %v", reflect.TypeOf(event.Object).Name())
 	}
-	data, err := codec.Encode(obj)
+	data, err := runtime.Encode(encoder, obj)
 	if err != nil {
 		return nil, err
 	}
-	return &WatchEvent{event.Type, runtime.RawExtension{json.RawMessage(data)}}, nil
+	return &WatchEvent{event.Type, runtime.RawExtension{Raw: json.RawMessage(data)}}, nil
 }

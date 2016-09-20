@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,10 +19,11 @@ package config
 import (
 	"sync"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/config"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/kubernetes/pkg/util/config"
 )
 
 // Operation is a type of operation of services or endpoints.
@@ -57,17 +58,17 @@ type EndpointsUpdate struct {
 
 // ServiceConfigHandler is an abstract interface of objects which receive update notifications for the set of services.
 type ServiceConfigHandler interface {
-	// OnUpdate gets called when a configuration has been changed by one of the sources.
+	// OnServiceUpdate gets called when a configuration has been changed by one of the sources.
 	// This is the union of all the configuration sources.
-	OnUpdate(services []api.Service)
+	OnServiceUpdate(services []api.Service)
 }
 
 // EndpointsConfigHandler is an abstract interface of objects which receive update notifications for the set of endpoints.
 type EndpointsConfigHandler interface {
-	// OnUpdate gets called when endpoints configuration is changed for a given
+	// OnEndpointsUpdate gets called when endpoints configuration is changed for a given
 	// service on any of the configuration sources. An example is when a new
 	// service comes up, or when containers come up or down for an existing service.
-	OnUpdate(endpoints []api.Endpoints)
+	OnEndpointsUpdate(endpoints []api.Endpoints)
 }
 
 // EndpointsConfig tracks a set of endpoints configurations.
@@ -81,7 +82,11 @@ type EndpointsConfig struct {
 // NewEndpointsConfig creates a new EndpointsConfig.
 // It immediately runs the created EndpointsConfig.
 func NewEndpointsConfig() *EndpointsConfig {
-	updates := make(chan struct{})
+	// The updates channel is used to send interrupts to the Endpoints handler.
+	// It's buffered because we never want to block for as long as there is a
+	// pending interrupt, but don't want to drop them if the handler is doing
+	// work.
+	updates := make(chan struct{}, 1)
 	store := &endpointsStore{updates: updates, endpoints: make(map[string]map[types.NamespacedName]api.Endpoints)}
 	mux := config.NewMux(store)
 	bcaster := config.NewBroadcaster()
@@ -91,7 +96,8 @@ func NewEndpointsConfig() *EndpointsConfig {
 
 func (c *EndpointsConfig) RegisterHandler(handler EndpointsConfigHandler) {
 	c.bcaster.Add(config.ListenerFunc(func(instance interface{}) {
-		handler.OnUpdate(instance.([]api.Endpoints))
+		glog.V(3).Infof("Calling handler.OnEndpointsUpdate()")
+		handler.OnEndpointsUpdate(instance.([]api.Endpoints))
 	}))
 }
 
@@ -126,32 +132,38 @@ func (s *endpointsStore) Merge(source string, change interface{}) error {
 	update := change.(EndpointsUpdate)
 	switch update.Op {
 	case ADD:
-		glog.V(4).Infof("Adding new endpoint from source %s : %+v", source, update.Endpoints)
+		glog.V(5).Infof("Adding new endpoint from source %s : %s", source, spew.Sdump(update.Endpoints))
 		for _, value := range update.Endpoints {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			endpoints[name] = value
 		}
 	case REMOVE:
-		glog.V(4).Infof("Removing an endpoint %+v", update)
+		glog.V(5).Infof("Removing an endpoint %s", spew.Sdump(update))
 		for _, value := range update.Endpoints {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			delete(endpoints, name)
 		}
 	case SET:
-		glog.V(4).Infof("Setting endpoints %+v", update)
+		glog.V(5).Infof("Setting endpoints %s", spew.Sdump(update))
 		// Clear the old map entries by just creating a new map
 		endpoints = make(map[types.NamespacedName]api.Endpoints)
 		for _, value := range update.Endpoints {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			endpoints[name] = value
 		}
 	default:
-		glog.V(4).Infof("Received invalid update type: %v", update)
+		glog.V(4).Infof("Received invalid update type: %s", spew.Sdump(update))
 	}
 	s.endpoints[source] = endpoints
 	s.endpointLock.Unlock()
 	if s.updates != nil {
-		s.updates <- struct{}{}
+		// Since we record the snapshot before sending this signal, it's
+		// possible that the consumer ends up performing an extra update.
+		select {
+		case s.updates <- struct{}{}:
+		default:
+			glog.V(4).Infof("Endpoints handler already has a pending interrupt.")
+		}
 	}
 	return nil
 }
@@ -179,7 +191,11 @@ type ServiceConfig struct {
 // NewServiceConfig creates a new ServiceConfig.
 // It immediately runs the created ServiceConfig.
 func NewServiceConfig() *ServiceConfig {
-	updates := make(chan struct{})
+	// The updates channel is used to send interrupts to the Services handler.
+	// It's buffered because we never want to block for as long as there is a
+	// pending interrupt, but don't want to drop them if the handler is doing
+	// work.
+	updates := make(chan struct{}, 1)
 	store := &serviceStore{updates: updates, services: make(map[string]map[types.NamespacedName]api.Service)}
 	mux := config.NewMux(store)
 	bcaster := config.NewBroadcaster()
@@ -189,7 +205,8 @@ func NewServiceConfig() *ServiceConfig {
 
 func (c *ServiceConfig) RegisterHandler(handler ServiceConfigHandler) {
 	c.bcaster.Add(config.ListenerFunc(func(instance interface{}) {
-		handler.OnUpdate(instance.([]api.Service))
+		glog.V(3).Infof("Calling handler.OnServiceUpdate()")
+		handler.OnServiceUpdate(instance.([]api.Service))
 	}))
 }
 
@@ -224,32 +241,38 @@ func (s *serviceStore) Merge(source string, change interface{}) error {
 	update := change.(ServiceUpdate)
 	switch update.Op {
 	case ADD:
-		glog.V(4).Infof("Adding new service from source %s : %+v", source, update.Services)
+		glog.V(5).Infof("Adding new service from source %s : %s", source, spew.Sdump(update.Services))
 		for _, value := range update.Services {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			services[name] = value
 		}
 	case REMOVE:
-		glog.V(4).Infof("Removing a service %+v", update)
+		glog.V(5).Infof("Removing a service %s", spew.Sdump(update))
 		for _, value := range update.Services {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			delete(services, name)
 		}
 	case SET:
-		glog.V(4).Infof("Setting services %+v", update)
+		glog.V(5).Infof("Setting services %s", spew.Sdump(update))
 		// Clear the old map entries by just creating a new map
 		services = make(map[types.NamespacedName]api.Service)
 		for _, value := range update.Services {
-			name := types.NamespacedName{value.Namespace, value.Name}
+			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
 			services[name] = value
 		}
 	default:
-		glog.V(4).Infof("Received invalid update type: %v", update)
+		glog.V(4).Infof("Received invalid update type: %s", spew.Sdump(update))
 	}
 	s.services[source] = services
 	s.serviceLock.Unlock()
 	if s.updates != nil {
-		s.updates <- struct{}{}
+		// Since we record the snapshot before sending this signal, it's
+		// possible that the consumer ends up performing an extra update.
+		select {
+		case s.updates <- struct{}{}:
+		default:
+			glog.V(4).Infof("Service handler already has a pending interrupt.")
+		}
 	}
 	return nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,20 +22,16 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authenticator"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/user"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/auth/authenticator"
+	"k8s.io/kubernetes/pkg/auth/user"
 
 	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/golang/glog"
 )
 
 const (
-	ServiceAccountUsernamePrefix    = "system:serviceaccount"
-	ServiceAccountUsernameSeparator = ":"
-
 	Issuer = "kubernetes/serviceaccount"
 
 	SubjectClaim            = "sub"
@@ -45,6 +41,12 @@ const (
 	SecretNameClaim         = "kubernetes.io/serviceaccount/secret.name"
 	NamespaceClaim          = "kubernetes.io/serviceaccount/namespace"
 )
+
+// ServiceAccountTokenGetter defines functions to retrieve a named service account and secret
+type ServiceAccountTokenGetter interface {
+	GetServiceAccount(namespace, name string) (*api.ServiceAccount, error)
+	GetSecret(namespace, name string) (*api.Secret, error)
+}
 
 type TokenGenerator interface {
 	// GenerateToken generates a token which will identify the given ServiceAccount.
@@ -76,26 +78,6 @@ func ReadPublicKey(file string) (*rsa.PublicKey, error) {
 	return jwt.ParseRSAPublicKeyFromPEM(data)
 }
 
-// MakeUsername generates a username from the given namespace and ServiceAccount name.
-// The resulting username can be passed to SplitUsername to extract the original namespace and ServiceAccount name.
-func MakeUsername(namespace, name string) string {
-	return strings.Join([]string{ServiceAccountUsernamePrefix, namespace, name}, ServiceAccountUsernameSeparator)
-}
-
-// SplitUsername returns the namespace and ServiceAccount name embedded in the given username,
-// or an error if the username is not a valid name produced by MakeUsername
-func SplitUsername(username string) (string, string, error) {
-	if !strings.HasPrefix(username, ServiceAccountUsernamePrefix+ServiceAccountUsernameSeparator) {
-		return "", "", fmt.Errorf("Username must be in the form %s", MakeUsername("namespace", "name"))
-	}
-	username = strings.TrimPrefix(username, ServiceAccountUsernamePrefix+ServiceAccountUsernameSeparator)
-	parts := strings.Split(username, ServiceAccountUsernameSeparator)
-	if len(parts) != 2 || len(parts[0]) == 0 || len(parts[1]) == 0 {
-		return "", "", fmt.Errorf("Username must be in the form %s", MakeUsername("namespace", "name"))
-	}
-	return parts[0], parts[1], nil
-}
-
 // JWTTokenGenerator returns a TokenGenerator that generates signed JWT tokens, using the given privateKey.
 // privateKey is a PEM-encoded byte array of a private RSA key.
 // JWTTokenAuthenticator()
@@ -110,17 +92,19 @@ type jwtTokenGenerator struct {
 func (j *jwtTokenGenerator) GenerateToken(serviceAccount api.ServiceAccount, secret api.Secret) (string, error) {
 	token := jwt.New(jwt.SigningMethodRS256)
 
-	// Identify the issuer
-	token.Claims[IssuerClaim] = Issuer
+	claims, _ := token.Claims.(jwt.MapClaims)
 
-	// Username: `serviceaccount:<namespace>:<serviceaccount>`
-	token.Claims[SubjectClaim] = MakeUsername(serviceAccount.Namespace, serviceAccount.Name)
+	// Identify the issuer
+	claims[IssuerClaim] = Issuer
+
+	// Username
+	claims[SubjectClaim] = MakeUsername(serviceAccount.Namespace, serviceAccount.Name)
 
 	// Persist enough structured info for the authenticator to be able to look up the service account and secret
-	token.Claims[NamespaceClaim] = serviceAccount.Namespace
-	token.Claims[ServiceAccountNameClaim] = serviceAccount.Name
-	token.Claims[ServiceAccountUIDClaim] = serviceAccount.UID
-	token.Claims[SecretNameClaim] = secret.Name
+	claims[NamespaceClaim] = serviceAccount.Namespace
+	claims[ServiceAccountNameClaim] = serviceAccount.Name
+	claims[ServiceAccountUIDClaim] = serviceAccount.UID
+	claims[SecretNameClaim] = secret.Name
 
 	// Sign and get the complete encoded token as a string
 	return token.SignedString(j.key)
@@ -174,32 +158,39 @@ func (j *jwtTokenAuthenticator) AuthenticateToken(token string) (user.Info, bool
 
 		// If we get here, we have a token with a recognized signature
 
+		claims, _ := parsedToken.Claims.(jwt.MapClaims)
+
 		// Make sure we issued the token
-		iss, _ := parsedToken.Claims[IssuerClaim].(string)
+		iss, _ := claims[IssuerClaim].(string)
 		if iss != Issuer {
 			return nil, false, nil
 		}
 
 		// Make sure the claims we need exist
-		sub, _ := parsedToken.Claims[SubjectClaim].(string)
+		sub, _ := claims[SubjectClaim].(string)
 		if len(sub) == 0 {
 			return nil, false, errors.New("sub claim is missing")
 		}
-		namespace, _ := parsedToken.Claims[NamespaceClaim].(string)
+		namespace, _ := claims[NamespaceClaim].(string)
 		if len(namespace) == 0 {
 			return nil, false, errors.New("namespace claim is missing")
 		}
-		secretName, _ := parsedToken.Claims[SecretNameClaim].(string)
+		secretName, _ := claims[SecretNameClaim].(string)
 		if len(namespace) == 0 {
 			return nil, false, errors.New("secretName claim is missing")
 		}
-		serviceAccountName, _ := parsedToken.Claims[ServiceAccountNameClaim].(string)
+		serviceAccountName, _ := claims[ServiceAccountNameClaim].(string)
 		if len(serviceAccountName) == 0 {
 			return nil, false, errors.New("serviceAccountName claim is missing")
 		}
-		serviceAccountUID, _ := parsedToken.Claims[ServiceAccountUIDClaim].(string)
+		serviceAccountUID, _ := claims[ServiceAccountUIDClaim].(string)
 		if len(serviceAccountUID) == 0 {
 			return nil, false, errors.New("serviceAccountUID claim is missing")
+		}
+
+		subjectNamespace, subjectName, err := SplitUsername(sub)
+		if err != nil || subjectNamespace != namespace || subjectName != serviceAccountName {
+			return nil, false, errors.New("sub claim is invalid")
 		}
 
 		if j.lookup {
@@ -226,11 +217,7 @@ func (j *jwtTokenAuthenticator) AuthenticateToken(token string) (user.Info, bool
 			}
 		}
 
-		return &user.DefaultInfo{
-			Name:   sub,
-			UID:    serviceAccountUID,
-			Groups: []string{},
-		}, true, nil
+		return UserInfo(namespace, serviceAccountName, serviceAccountUID), true, nil
 	}
 
 	return nil, false, validationError

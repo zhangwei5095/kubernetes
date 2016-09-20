@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,10 +23,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/unversioned/fake"
+	"k8s.io/kubernetes/pkg/kubectl/resource"
+	"k8s.io/kubernetes/pkg/runtime"
 )
 
 func TestValidateLabels(t *testing.T) {
@@ -256,7 +258,7 @@ func TestLabelFunc(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		out, err := labelFunc(test.obj, test.overwrite, test.version, test.labels, test.remove)
+		err := labelFunc(test.obj, test.overwrite, test.version, test.labels, test.remove)
 		if test.expectErr {
 			if err == nil {
 				t.Errorf("unexpected non-error: %v", test)
@@ -266,8 +268,8 @@ func TestLabelFunc(t *testing.T) {
 		if !test.expectErr && err != nil {
 			t.Errorf("unexpected error: %v %v", err, test)
 		}
-		if !reflect.DeepEqual(out, test.expected) {
-			t.Errorf("expected: %v, got %v", test.expected, out)
+		if !reflect.DeepEqual(test.obj, test.expected) {
+			t.Errorf("expected: %v, got %v", test.expected, test.obj)
 		}
 	}
 }
@@ -294,13 +296,25 @@ func TestLabelErrors(t *testing.T) {
 			args:  []string{"pods=bar"},
 			errFn: func(err error) bool { return strings.Contains(err.Error(), "one or more resources must be specified") },
 		},
+		"resources but no selectors": {
+			args: []string{"pods", "app=bar"},
+			errFn: func(err error) bool {
+				return strings.Contains(err.Error(), "resource(s) were provided, but no name, label selector, or --all flag specified")
+			},
+		},
+		"multiple resources but no selectors": {
+			args: []string{"pods,deployments", "app=bar"},
+			errFn: func(err error) bool {
+				return strings.Contains(err.Error(), "resource(s) were provided, but no name, label selector, or --all flag specified")
+			},
+		},
 	}
 
 	for k, testCase := range testCases {
-		f, tf, _ := NewAPIFactory()
+		f, tf, _, _ := NewAPIFactory()
 		tf.Printer = &testPrinter{}
 		tf.Namespace = "test"
-		tf.ClientConfig = &client.Config{Version: testapi.Version()}
+		tf.ClientConfig = &restclient.Config{ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}}
 
 		buf := bytes.NewBuffer([]byte{})
 		cmd := NewCmdLabel(f, buf)
@@ -309,7 +323,7 @@ func TestLabelErrors(t *testing.T) {
 		for k, v := range testCase.flags {
 			cmd.Flags().Set(k, v)
 		}
-		err := RunLabel(f, buf, cmd, testCase.args)
+		err := RunLabel(f, buf, cmd, testCase.args, &resource.FilenameOptions{})
 		if !testCase.errFn(err) {
 			t.Errorf("%s: unexpected error: %v", k, err)
 			continue
@@ -323,29 +337,25 @@ func TestLabelErrors(t *testing.T) {
 	}
 }
 
-func TestLabelMultipleObjects(t *testing.T) {
+func TestLabelForResourceFromFile(t *testing.T) {
 	pods, _, _ := testData()
-
-	f, tf, codec := NewAPIFactory()
-	tf.Printer = &testPrinter{}
-	tf.Client = &client.FakeRESTClient{
-		Codec: codec,
-		Client: client.HTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+	f, tf, codec, ns := NewAPIFactory()
+	tf.Client = &fake.RESTClient{
+		NegotiatedSerializer: ns,
+		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.Method {
 			case "GET":
 				switch req.URL.Path {
-				case "/namespaces/test/pods":
-					return &http.Response{StatusCode: 200, Body: objBody(codec, pods)}, nil
+				case "/namespaces/test/replicationcontrollers/cassandra":
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: objBody(codec, &pods.Items[0])}, nil
 				default:
 					t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
 					return nil, nil
 				}
-			case "PUT":
+			case "PATCH":
 				switch req.URL.Path {
-				case "/namespaces/test/pods/foo":
-					return &http.Response{StatusCode: 200, Body: objBody(codec, &pods.Items[0])}, nil
-				case "/namespaces/test/pods/bar":
-					return &http.Response{StatusCode: 200, Body: objBody(codec, &pods.Items[1])}, nil
+				case "/namespaces/test/replicationcontrollers/cassandra":
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: objBody(codec, &pods.Items[0])}, nil
 				default:
 					t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
 					return nil, nil
@@ -357,20 +367,64 @@ func TestLabelMultipleObjects(t *testing.T) {
 		}),
 	}
 	tf.Namespace = "test"
-	tf.ClientConfig = &client.Config{Version: testapi.Version()}
+	tf.ClientConfig = &restclient.Config{ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}}
+
 	buf := bytes.NewBuffer([]byte{})
-
 	cmd := NewCmdLabel(f, buf)
+	options := &resource.FilenameOptions{}
+	options.Filenames = []string{"../../../examples/storage/cassandra/cassandra-controller.yaml"}
 
-	cmd.Flags().Set("all", "true")
-	if err := RunLabel(f, buf, cmd, []string{"pods", "a=b"}); err != nil {
+	err := RunLabel(f, buf, cmd, []string{"a=b"}, options)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if tf.Printer.(*testPrinter).Objects == nil {
-		t.Errorf("unexpected non print to default printer")
+	if !strings.Contains(buf.String(), "labeled") {
+		t.Errorf("did not set labels: %s", buf.String())
 	}
-	if !reflect.DeepEqual(tf.Printer.(*testPrinter).Objects[0].(*api.Pod).Labels, map[string]string{"a": "b"}) {
-		t.Errorf("did not set labels: %#v", string(buf.Bytes()))
+}
+
+func TestLabelMultipleObjects(t *testing.T) {
+	pods, _, _ := testData()
+	f, tf, codec, ns := NewAPIFactory()
+	tf.Client = &fake.RESTClient{
+		NegotiatedSerializer: ns,
+		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.Method {
+			case "GET":
+				switch req.URL.Path {
+				case "/namespaces/test/pods":
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: objBody(codec, pods)}, nil
+				default:
+					t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
+					return nil, nil
+				}
+			case "PATCH":
+				switch req.URL.Path {
+				case "/namespaces/test/pods/foo":
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: objBody(codec, &pods.Items[0])}, nil
+				case "/namespaces/test/pods/bar":
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: objBody(codec, &pods.Items[1])}, nil
+				default:
+					t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
+					return nil, nil
+				}
+			default:
+				t.Fatalf("unexpected request: %s %#v\n%#v", req.Method, req.URL, req)
+				return nil, nil
+			}
+		}),
+	}
+	tf.Namespace = "test"
+	tf.ClientConfig = &restclient.Config{ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}}
+
+	buf := bytes.NewBuffer([]byte{})
+	cmd := NewCmdLabel(f, buf)
+	cmd.Flags().Set("all", "true")
+
+	if err := RunLabel(f, buf, cmd, []string{"pods", "a=b"}, &resource.FilenameOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Count(buf.String(), "labeled") != len(pods.Items) {
+		t.Errorf("not all labels are set: %s", buf.String())
 	}
 }

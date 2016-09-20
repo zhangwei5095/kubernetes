@@ -1,3 +1,4 @@
+{% set master_extra_sans=grains.get('master_extra_sans', '') %}
 {% if grains.cloud is defined %}
   {% if grains.cloud == 'gce' %}
     {% set cert_ip='_use_gce_external_ip_' %}
@@ -5,13 +6,10 @@
   {% if grains.cloud == 'aws' %}
     {% set cert_ip='_use_aws_external_ip_' %}
   {% endif %}
-  {% if grains.cloud == 'azure' %}
+  {% if grains.cloud == 'azure-legacy' %}
     {% set cert_ip='_use_azure_dns_name_' %}
   {% endif %}
-  {% if grains.cloud == 'vagrant' %}
-    {% set cert_ip=grains.ip_interfaces.eth1[0] %}
-  {% endif %}
-  {% if grains.cloud == 'vsphere' %}
+  {% if grains.cloud == 'vsphere' or grains.cloud == 'photon-controller' %}
     {% set cert_ip=grains.ip_interfaces.eth0[0] %}
   {% endif %}
 {% endif %}
@@ -26,6 +24,9 @@
   {% set certgen="make-ca-cert.sh" %}
 {% endif %}
 
+openssl:
+  pkg.installed: []
+
 kube-cert:
   group.present:
     - system: True
@@ -35,7 +36,7 @@ kubernetes-cert:
     - unless: test -f /srv/kubernetes/server.cert
     - source: salt://generate-cert/{{certgen}}
 {% if cert_ip is defined %}
-    - args: {{cert_ip}}
+    - args: {{cert_ip}} {{master_extra_sans}}
     - require:
       - pkg: curl
 {% endif %}
@@ -43,3 +44,5 @@ kubernetes-cert:
     - user: root
     - group: root
     - shell: /bin/bash
+    - require:
+      - pkg: openssl

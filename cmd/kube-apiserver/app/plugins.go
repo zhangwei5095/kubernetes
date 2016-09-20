@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,23 +21,24 @@ package app
 // given binary target.
 import (
 	// Cloud providers
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/aws"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/gce"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/mesos"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/openstack"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/ovirt"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/rackspace"
-	_ "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/vagrant"
+	_ "k8s.io/kubernetes/pkg/cloudprovider/providers"
 
 	// Admission policies
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/admit"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/deny"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/exec/denyprivileged"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/limitranger"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/namespace/autoprovision"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/namespace/exists"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/namespace/lifecycle"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/resourcequota"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/securitycontext/scdeny"
-	_ "github.com/GoogleCloudPlatform/kubernetes/plugin/pkg/admission/serviceaccount"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/admit"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/alwayspullimages"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/antiaffinity"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/deny"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/exec"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/imagepolicy"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/initialresources"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/limitranger"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/namespace/autoprovision"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/namespace/exists"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/namespace/lifecycle"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/persistentvolume/label"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/resourcequota"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/security/podsecuritypolicy"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/securitycontext/scdeny"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/serviceaccount"
+	_ "k8s.io/kubernetes/plugin/pkg/admission/storageclass/default"
 )

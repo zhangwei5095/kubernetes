@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,30 +20,39 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
+	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/unversioned/fake"
+	"k8s.io/kubernetes/pkg/util/term"
 )
 
 type fakeRemoteExecutor struct {
-	req     *client.Request
+	method  string
+	url     *url.URL
 	execErr error
 }
 
-func (f *fakeRemoteExecutor) Execute(req *client.Request, config *client.Config, command []string, stdin io.Reader, stdout, stderr io.Writer, tty bool) error {
-	f.req = req
+func (f *fakeRemoteExecutor) Execute(method string, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue term.TerminalSizeQueue) error {
+	f.method = method
+	f.url = url
 	return f.execErr
 }
 
 func TestPodAndContainer(t *testing.T) {
 	tests := []struct {
 		args              []string
-		p                 *execParams
+		argsLenAtDash     int
+		p                 *ExecOptions
 		name              string
 		expectError       bool
 		expectedPod       string
@@ -51,43 +60,65 @@ func TestPodAndContainer(t *testing.T) {
 		expectedArgs      []string
 	}{
 		{
-			p:           &execParams{},
-			expectError: true,
-			name:        "empty",
+			p:             &ExecOptions{},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "empty",
 		},
 		{
-			p:           &execParams{podName: "foo"},
-			expectError: true,
-			name:        "no cmd",
+			p:             &ExecOptions{StreamOptions: StreamOptions{PodName: "foo"}},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "no cmd",
 		},
 		{
-			p:           &execParams{podName: "foo", containerName: "bar"},
-			expectError: true,
-			name:        "no cmd, w/ container",
+			p:             &ExecOptions{StreamOptions: StreamOptions{PodName: "foo", ContainerName: "bar"}},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "no cmd, w/ container",
 		},
 		{
-			p:            &execParams{podName: "foo"},
-			args:         []string{"cmd"},
-			expectedPod:  "foo",
-			expectedArgs: []string{"cmd"},
-			name:         "pod in flags",
+			p:             &ExecOptions{StreamOptions: StreamOptions{PodName: "foo"}},
+			args:          []string{"cmd"},
+			argsLenAtDash: -1,
+			expectedPod:   "foo",
+			expectedArgs:  []string{"cmd"},
+			name:          "pod in flags",
 		},
 		{
-			p:           &execParams{},
-			args:        []string{"foo"},
-			expectError: true,
-			name:        "no cmd, w/o flags",
+			p:             &ExecOptions{},
+			args:          []string{"foo", "cmd"},
+			argsLenAtDash: 0,
+			expectError:   true,
+			name:          "no pod, pod name is behind dash",
 		},
 		{
-			p:            &execParams{},
-			args:         []string{"foo", "cmd"},
-			expectedPod:  "foo",
-			expectedArgs: []string{"cmd"},
-			name:         "cmd, w/o flags",
+			p:             &ExecOptions{},
+			args:          []string{"foo"},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "no cmd, w/o flags",
 		},
 		{
-			p:                 &execParams{containerName: "bar"},
+			p:             &ExecOptions{},
+			args:          []string{"foo", "cmd"},
+			argsLenAtDash: -1,
+			expectedPod:   "foo",
+			expectedArgs:  []string{"cmd"},
+			name:          "cmd, w/o flags",
+		},
+		{
+			p:             &ExecOptions{},
+			args:          []string{"foo", "cmd"},
+			argsLenAtDash: 1,
+			expectedPod:   "foo",
+			expectedArgs:  []string{"cmd"},
+			name:          "cmd, cmd is behind dash",
+		},
+		{
+			p:                 &ExecOptions{StreamOptions: StreamOptions{ContainerName: "bar"}},
 			args:              []string{"foo", "cmd"},
+			argsLenAtDash:     -1,
 			expectedPod:       "foo",
 			expectedContainer: "bar",
 			expectedArgs:      []string{"cmd"},
@@ -95,81 +126,77 @@ func TestPodAndContainer(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
+		f, tf, _, ns := NewAPIFactory()
+		tf.Client = &fake.RESTClient{
+			NegotiatedSerializer: ns,
+			Client:               fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) { return nil, nil }),
+		}
+		tf.Namespace = "test"
+		tf.ClientConfig = defaultClientConfig()
+
 		cmd := &cobra.Command{}
-		podName, containerName, args, err := extractPodAndContainer(cmd, test.args, test.p)
-		if podName != test.expectedPod {
-			t.Errorf("expected: %s, got: %s (%s)", test.expectedPod, podName, test.name)
-		}
-		if containerName != test.expectedContainer {
-			t.Errorf("expected: %s, got: %s (%s)", test.expectedContainer, containerName, test.name)
-		}
+		options := test.p
+		err := options.Complete(f, cmd, test.args, test.argsLenAtDash)
 		if test.expectError && err == nil {
 			t.Errorf("unexpected non-error (%s)", test.name)
 		}
 		if !test.expectError && err != nil {
 			t.Errorf("unexpected error: %v (%s)", err, test.name)
 		}
-		if !reflect.DeepEqual(test.expectedArgs, args) {
-			t.Errorf("expected: %v, got %v (%s)", test.expectedArgs, args, test.name)
+		if err != nil {
+			continue
+		}
+		if options.PodName != test.expectedPod {
+			t.Errorf("expected: %s, got: %s (%s)", test.expectedPod, options.PodName, test.name)
+		}
+		if options.ContainerName != test.expectedContainer {
+			t.Errorf("expected: %s, got: %s (%s)", test.expectedContainer, options.ContainerName, test.name)
+		}
+		if !reflect.DeepEqual(test.expectedArgs, options.Command) {
+			t.Errorf("expected: %v, got %v (%s)", test.expectedArgs, options.Command, test.name)
 		}
 	}
 }
 
 func TestExec(t *testing.T) {
+	version := testapi.Default.GroupVersion().Version
 	tests := []struct {
-		name, version, podPath, execPath, container string
-		pod                                         *api.Pod
-		execErr                                     bool
+		name, podPath, execPath, container string
+		pod                                *api.Pod
+		execErr                            bool
 	}{
 		{
-			name:     "v1beta3 - pod exec",
-			version:  "v1beta3",
-			podPath:  "/api/v1beta3/namespaces/test/pods/foo",
-			execPath: "/api/v1beta3/namespaces/test/pods/foo/exec",
+			name:     "pod exec",
+			podPath:  "/api/" + version + "/namespaces/test/pods/foo",
+			execPath: "/api/" + version + "/namespaces/test/pods/foo/exec",
 			pod:      execPod(),
 		},
 		{
-			name:     "v1beta3 - pod exec error",
-			version:  "v1beta3",
-			podPath:  "/api/v1beta3/namespaces/test/pods/foo",
-			execPath: "/api/v1beta3/namespaces/test/pods/foo/exec",
-			pod:      execPod(),
-			execErr:  true,
-		},
-		{
-			name:     "v1 - pod exec",
-			version:  "v1",
-			podPath:  "/api/v1/namespaces/test/pods/foo",
-			execPath: "/api/v1/namespaces/test/pods/foo/exec",
-			pod:      execPod(),
-		},
-		{
-			name:     "v1 - pod exec error",
-			version:  "v1",
-			podPath:  "/api/v1/namespaces/test/pods/foo",
-			execPath: "/api/v1/namespaces/test/pods/foo/exec",
+			name:     "pod exec error",
+			podPath:  "/api/" + version + "/namespaces/test/pods/foo",
+			execPath: "/api/" + version + "/namespaces/test/pods/foo/exec",
 			pod:      execPod(),
 			execErr:  true,
 		},
 	}
 	for _, test := range tests {
-		f, tf, codec := NewAPIFactory()
-		tf.Client = &client.FakeRESTClient{
-			Codec: codec,
-			Client: client.HTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+		f, tf, codec, ns := NewAPIFactory()
+		tf.Client = &fake.RESTClient{
+			NegotiatedSerializer: ns,
+			Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 				switch p, m := req.URL.Path, req.Method; {
 				case p == test.podPath && m == "GET":
 					body := objBody(codec, test.pod)
-					return &http.Response{StatusCode: 200, Body: body}, nil
+					return &http.Response{StatusCode: 200, Header: defaultHeader(), Body: body}, nil
 				default:
 					// Ensures no GET is performed when deleting by name
-					t.Errorf("%s: unexpected request: %#v\n%#v", test.name, req.URL, req)
-					return nil, nil
+					t.Errorf("%s: unexpected request: %s %#v\n%#v", test.name, req.Method, req.URL, req)
+					return nil, fmt.Errorf("unexpected request")
 				}
 			}),
 		}
 		tf.Namespace = "test"
-		tf.ClientConfig = &client.Config{Version: test.version}
+		tf.ClientConfig = defaultClientConfig()
 		bufOut := bytes.NewBuffer([]byte{})
 		bufErr := bytes.NewBuffer([]byte{})
 		bufIn := bytes.NewBuffer([]byte{})
@@ -177,20 +204,39 @@ func TestExec(t *testing.T) {
 		if test.execErr {
 			ex.execErr = fmt.Errorf("exec error")
 		}
-		params := &execParams{
-			podName:       "foo",
-			containerName: "bar",
+		params := &ExecOptions{
+			StreamOptions: StreamOptions{
+				PodName:       "foo",
+				ContainerName: "bar",
+				In:            bufIn,
+				Out:           bufOut,
+				Err:           bufErr,
+			},
+			Executor: ex,
 		}
 		cmd := &cobra.Command{}
-		err := RunExec(f, cmd, bufIn, bufOut, bufErr, params, []string{"test", "command"}, ex)
+		args := []string{"test", "command"}
+		if err := params.Complete(f, cmd, args, -1); err != nil {
+			t.Fatal(err)
+		}
+		err := params.Run()
 		if test.execErr && err != ex.execErr {
 			t.Errorf("%s: Unexpected exec error: %v", test.name, err)
-		}
-		if !test.execErr && ex.req.URL().Path != test.execPath {
-			t.Errorf("%s: Did not get expected path for exec request", test.name)
+			continue
 		}
 		if !test.execErr && err != nil {
 			t.Errorf("%s: Unexpected error: %v", test.name, err)
+			continue
+		}
+		if test.execErr {
+			continue
+		}
+		if ex.url.Path != test.execPath {
+			t.Errorf("%s: Did not get expected path for exec request", test.name)
+			continue
+		}
+		if ex.method != "POST" {
+			t.Errorf("%s: Did not get method for exec request: %s", test.name, ex.method)
 		}
 	}
 }
@@ -210,5 +256,126 @@ func execPod() *api.Pod {
 		Status: api.PodStatus{
 			Phase: api.PodRunning,
 		},
+	}
+}
+
+func TestSetupTTY(t *testing.T) {
+	stderr := &bytes.Buffer{}
+
+	// test 1 - don't attach stdin
+	o := &StreamOptions{
+		// InterruptParent: ,
+		Stdin: false,
+		In:    &bytes.Buffer{},
+		Out:   &bytes.Buffer{},
+		Err:   stderr,
+		TTY:   true,
+	}
+
+	tty := o.setupTTY()
+
+	if o.In != nil {
+		t.Errorf("don't attach stdin: o.In should be nil")
+	}
+	if tty.In != nil {
+		t.Errorf("don't attach stdin: tty.In should be nil")
+	}
+	if o.TTY {
+		t.Errorf("don't attach stdin: o.TTY should be false")
+	}
+	if tty.Raw {
+		t.Errorf("don't attach stdin: tty.Raw should be false")
+	}
+	if len(stderr.String()) > 0 {
+		t.Errorf("don't attach stdin: stderr wasn't empty: %s", stderr.String())
+	}
+
+	// tests from here on attach stdin
+	// test 2 - don't request a TTY
+	o.Stdin = true
+	o.In = &bytes.Buffer{}
+	o.TTY = false
+
+	tty = o.setupTTY()
+
+	if o.In == nil {
+		t.Errorf("attach stdin, no TTY: o.In should not be nil")
+	}
+	if tty.In != o.In {
+		t.Errorf("attach stdin, no TTY: tty.In should equal o.In")
+	}
+	if o.TTY {
+		t.Errorf("attach stdin, no TTY: o.TTY should be false")
+	}
+	if tty.Raw {
+		t.Errorf("attach stdin, no TTY: tty.Raw should be false")
+	}
+	if len(stderr.String()) > 0 {
+		t.Errorf("attach stdin, no TTY: stderr wasn't empty: %s", stderr.String())
+	}
+
+	// test 3 - request a TTY, but stdin is not a terminal
+	o.Stdin = true
+	o.In = &bytes.Buffer{}
+	o.Err = stderr
+	o.TTY = true
+
+	tty = o.setupTTY()
+
+	if o.In == nil {
+		t.Errorf("attach stdin, TTY, not a terminal: o.In should not be nil")
+	}
+	if tty.In != o.In {
+		t.Errorf("attach stdin, TTY, not a terminal: tty.In should equal o.In")
+	}
+	if o.TTY {
+		t.Errorf("attach stdin, TTY, not a terminal: o.TTY should be false")
+	}
+	if tty.Raw {
+		t.Errorf("attach stdin, TTY, not a terminal: tty.Raw should be false")
+	}
+	if !strings.Contains(stderr.String(), "input is not a terminal") {
+		t.Errorf("attach stdin, TTY, not a terminal: expected 'input is not a terminal' to stderr")
+	}
+
+	// test 4 - request a TTY, stdin is a terminal
+	o.Stdin = true
+	o.In = &bytes.Buffer{}
+	stderr.Reset()
+	o.TTY = true
+
+	overrideStdin := ioutil.NopCloser(&bytes.Buffer{})
+	overrideStdout := &bytes.Buffer{}
+	overrideStderr := &bytes.Buffer{}
+	o.overrideStreams = func() (io.ReadCloser, io.Writer, io.Writer) {
+		return overrideStdin, overrideStdout, overrideStderr
+	}
+
+	o.isTerminalIn = func(tty term.TTY) bool {
+		return true
+	}
+
+	tty = o.setupTTY()
+
+	if o.In != overrideStdin {
+		t.Errorf("attach stdin, TTY, is a terminal: o.In should equal overrideStdin")
+	}
+	if tty.In != o.In {
+		t.Errorf("attach stdin, TTY, is a terminal: tty.In should equal o.In")
+	}
+	if !o.TTY {
+		t.Errorf("attach stdin, TTY, is a terminal: o.TTY should be true")
+	}
+	if !tty.Raw {
+		t.Errorf("attach stdin, TTY, is a terminal: tty.Raw should be true")
+	}
+	if len(stderr.String()) > 0 {
+		t.Errorf("attach stdin, TTY, is a terminal: stderr wasn't empty: %s", stderr.String())
+	}
+	if o.Out != overrideStdout {
+		t.Errorf("attach stdin, TTY, is a terminal: o.Out should equal overrideStdout")
+	}
+	if tty.Out != o.Out {
+		t.Errorf("attach stdin, TTY, is a terminal: tty.Out should equal o.Out")
 	}
 }

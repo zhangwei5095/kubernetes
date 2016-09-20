@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +19,27 @@
 # - CLUSTER_NAME  (the name of the cluster)
 
 ZONE="${ZONE:-us-central1-f}"
-NUM_MINIONS="${NUM_MINIONS:-2}"
+NUM_NODES="${NUM_NODES:-3}"
+ADDITIONAL_ZONES="${ADDITIONAL_ZONES:-}"
 CLUSTER_API_VERSION="${CLUSTER_API_VERSION:-}"
-# TODO(mbforbes): Actually plumb this through; this currently only works
-#                 because we use the 'default' network by default.
 NETWORK="${NETWORK:-default}"
 NETWORK_RANGE="${NETWORK_RANGE:-10.240.0.0/16}"
 FIREWALL_SSH="${FIREWALL_SSH:-${NETWORK}-allow-ssh}"
 GCLOUD="${GCLOUD:-gcloud}"
-CMD_GROUP="${CMD_GROUP:-alpha}"
+CMD_GROUP="${CMD_GROUP:-}"
 GCLOUD_CONFIG_DIR="${GCLOUD_CONFIG_DIR:-${HOME}/.config/gcloud/kubernetes}"
-ENABLE_CLUSTER_DNS=false
+MACHINE_TYPE="${MACHINE_TYPE:-n1-standard-2}"
+IMAGE_TYPE="${IMAGE_TYPE:-}"
+if [[ "${FEDERATION:-}" == true ]]; then
+    NODE_SCOPES="${NODE_SCOPES:-compute-rw,storage-ro,https://www.googleapis.com/auth/ndev.clouddns.readwrite}"
+else
+    NODE_SCOPES="${NODE_SCOPES:-compute-rw,storage-ro}"
+fi
+
+# WARNING: any new vars added here must correspond to options that can be
+# passed to `gcloud {CMD_GROUP} container clusters create`, or they will
+# have no effect. If you change/add a var used to toggle a value in
+# cluster/gce/configure-vm.sh, please ping someone on GKE.
 
 # This is a hack, but I keep setting this when I run commands manually, and
 # then things grossly fail during normal runs because cluster/kubecfg.sh and

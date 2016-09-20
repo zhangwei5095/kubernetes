@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,130 +17,171 @@ limitations under the License.
 package aws_ebs
 
 import (
-	"errors"
 	"fmt"
-	"os"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/exec"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/mount"
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/cloudprovider"
+	"k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
+	"k8s.io/kubernetes/pkg/volume"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+)
+
+const (
+	diskPartitionSuffix = ""
+	diskXVDPath         = "/dev/xvd"
+	diskXVDPattern      = "/dev/xvd*"
+	maxChecks           = 60
+	maxRetries          = 10
+	checkSleepDuration  = time.Second
+	errorSleepDuration  = 5 * time.Second
 )
 
 type AWSDiskUtil struct{}
 
-// Attaches a disk specified by a volume.AWSElasticBlockStore to the current kubelet.
-// Mounts the disk to it's global path.
-func (util *AWSDiskUtil) AttachAndMountDisk(pd *awsElasticBlockStore, globalPDPath string) error {
-	volumes, err := pd.getVolumeProvider()
+func (util *AWSDiskUtil) DeleteVolume(d *awsElasticBlockStoreDeleter) error {
+	cloud, err := getCloudProvider(d.awsElasticBlockStore.plugin.host.GetCloudProvider())
 	if err != nil {
 		return err
-	}
-	devicePath, err := volumes.AttachDisk("", pd.volumeID, pd.readOnly)
-	if err != nil {
-		return err
-	}
-	if pd.partition != "" {
-		devicePath = devicePath + pd.partition
-	}
-	//TODO(jonesdl) There should probably be better method than busy-waiting here.
-	numTries := 0
-	for {
-		_, err := os.Stat(devicePath)
-		if err == nil {
-			break
-		}
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		numTries++
-		if numTries == 10 {
-			return errors.New("Could not attach disk: Timeout after 10s (" + devicePath + ")")
-		}
-		time.Sleep(time.Second)
 	}
 
-	// Only mount the PD globally once.
-	mountpoint, err := pd.mounter.IsMountPoint(globalPDPath)
+	deleted, err := cloud.DeleteDisk(d.volumeID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(globalPDPath, 0750); err != nil {
-				return err
+		glog.V(2).Infof("Error deleting EBS Disk volume %s: %v", d.volumeID, err)
+		return err
+	}
+	if deleted {
+		glog.V(2).Infof("Successfully deleted EBS Disk volume %s", d.volumeID)
+	} else {
+		glog.V(2).Infof("Successfully deleted EBS Disk volume %s (actually already deleted)", d.volumeID)
+	}
+	return nil
+}
+
+// CreateVolume creates an AWS EBS volume.
+// Returns: volumeID, volumeSizeGB, labels, error
+func (util *AWSDiskUtil) CreateVolume(c *awsElasticBlockStoreProvisioner) (string, int, map[string]string, error) {
+	cloud, err := getCloudProvider(c.awsElasticBlockStore.plugin.host.GetCloudProvider())
+	if err != nil {
+		return "", 0, nil, err
+	}
+
+	// AWS volumes don't have Name field, store the name in Name tag
+	var tags map[string]string
+	if c.options.CloudTags == nil {
+		tags = make(map[string]string)
+	} else {
+		tags = *c.options.CloudTags
+	}
+	tags["Name"] = volume.GenerateVolumeName(c.options.ClusterName, c.options.PVName, 255) // AWS tags can have 255 characters
+
+	requestBytes := c.options.Capacity.Value()
+	// AWS works with gigabytes, convert to GiB with rounding up
+	requestGB := int(volume.RoundUpSize(requestBytes, 1024*1024*1024))
+	volumeOptions := &aws.VolumeOptions{
+		CapacityGB: requestGB,
+		Tags:       tags,
+		PVCName:    c.options.PVCName,
+	}
+	// Apply Parameters (case-insensitive). We leave validation of
+	// the values to the cloud provider.
+	for k, v := range c.options.Parameters {
+		switch strings.ToLower(k) {
+		case "type":
+			volumeOptions.VolumeType = v
+		case "zone":
+			volumeOptions.AvailabilityZone = v
+		case "iopspergb":
+			volumeOptions.IOPSPerGB, err = strconv.Atoi(v)
+			if err != nil {
+				return "", 0, nil, fmt.Errorf("invalid iopsPerGB value %q, must be integer between 1 and 30: %v", v, err)
 			}
-			mountpoint = false
+		case "encrypted":
+			volumeOptions.Encrypted, err = strconv.ParseBool(v)
+			if err != nil {
+				return "", 0, nil, fmt.Errorf("invalid encrypted boolean value %q, must be true or false: %v", v, err)
+			}
+		case "kmskeyid":
+			volumeOptions.KmsKeyId = v
+		default:
+			return "", 0, nil, fmt.Errorf("invalid option %q for volume plugin %s", k, c.plugin.GetPluginName())
+		}
+	}
+
+	// TODO: implement c.options.ProvisionerSelector parsing
+	if c.options.Selector != nil {
+		return "", 0, nil, fmt.Errorf("claim.Spec.Selector is not supported for dynamic provisioning on AWS")
+	}
+
+	name, err := cloud.CreateDisk(volumeOptions)
+	if err != nil {
+		glog.V(2).Infof("Error creating EBS Disk volume: %v", err)
+		return "", 0, nil, err
+	}
+	glog.V(2).Infof("Successfully created EBS Disk volume %s", name)
+
+	labels, err := cloud.GetVolumeLabels(name)
+	if err != nil {
+		// We don't really want to leak the volume here...
+		glog.Errorf("error building labels for new EBS volume %q: %v", name, err)
+	}
+
+	return name, int(requestGB), labels, nil
+}
+
+// Returns the first path that exists, or empty string if none exist.
+func verifyDevicePath(devicePaths []string) (string, error) {
+	for _, path := range devicePaths {
+		if pathExists, err := volumeutil.PathExists(path); err != nil {
+			return "", fmt.Errorf("Error checking if path exists: %v", err)
+		} else if pathExists {
+			return path, nil
+		}
+	}
+
+	return "", nil
+}
+
+// Returns the first path that exists, or empty string if none exist.
+func verifyAllPathsRemoved(devicePaths []string) (bool, error) {
+	allPathsRemoved := true
+	for _, path := range devicePaths {
+		if exists, err := volumeutil.PathExists(path); err != nil {
+			return false, fmt.Errorf("Error checking if path exists: %v", err)
 		} else {
-			return err
+			allPathsRemoved = allPathsRemoved && !exists
 		}
 	}
-	options := []string{}
-	if pd.readOnly {
-		options = append(options, "ro")
+
+	return allPathsRemoved, nil
+}
+
+// Returns list of all paths for given EBS mount
+// This is more interesting on GCE (where we are able to identify volumes under /dev/disk-by-id)
+// Here it is mostly about applying the partition path
+func getDiskByIdPaths(partition string, devicePath string) []string {
+	devicePaths := []string{}
+	if devicePath != "" {
+		devicePaths = append(devicePaths, devicePath)
 	}
-	if !mountpoint {
-		err = pd.diskMounter.Mount(devicePath, globalPDPath, pd.fsType, options)
-		if err != nil {
-			os.Remove(globalPDPath)
-			return err
+
+	if partition != "" {
+		for i, path := range devicePaths {
+			devicePaths[i] = path + diskPartitionSuffix + partition
 		}
 	}
-	return nil
+
+	return devicePaths
 }
 
-// Unmounts the device and detaches the disk from the kubelet's host machine.
-func (util *AWSDiskUtil) DetachDisk(pd *awsElasticBlockStore) error {
-	// Unmount the global PD mount, which should be the only one.
-	globalPDPath := makeGlobalPDPath(pd.plugin.host, pd.volumeID)
-	if err := pd.mounter.Unmount(globalPDPath); err != nil {
-		glog.V(2).Info("Error unmount dir ", globalPDPath, ": ", err)
-		return err
+// Return cloud provider
+func getCloudProvider(cloudProvider cloudprovider.Interface) (*aws.Cloud, error) {
+	awsCloudProvider, ok := cloudProvider.(*aws.Cloud)
+	if !ok || awsCloudProvider == nil {
+		return nil, fmt.Errorf("Failed to get AWS Cloud Provider. GetCloudProvider returned %v instead", cloudProvider)
 	}
-	if err := os.Remove(globalPDPath); err != nil {
-		glog.V(2).Info("Error removing dir ", globalPDPath, ": ", err)
-		return err
-	}
-	// Detach the disk
-	volumes, err := pd.getVolumeProvider()
-	if err != nil {
-		glog.V(2).Info("Error getting volume provider for volumeID ", pd.volumeID, ": ", err)
-		return err
-	}
-	if err := volumes.DetachDisk("", pd.volumeID); err != nil {
-		glog.V(2).Info("Error detaching disk ", pd.volumeID, ": ", err)
-		return err
-	}
-	return nil
-}
 
-// safe_format_and_mount is a utility script on AWS VMs that probes a persistent disk, and if
-// necessary formats it before mounting it.
-// This eliminates the necessity to format a PD before it is used with a Pod on AWS.
-// TODO: port this script into Go and use it for all Linux platforms
-type awsSafeFormatAndMount struct {
-	mount.Interface
-	runner exec.Interface
-}
-
-// uses /usr/share/google/safe_format_and_mount to optionally mount, and format a disk
-func (mounter *awsSafeFormatAndMount) Mount(source string, target string, fstype string, options []string) error {
-	// Don't attempt to format if mounting as readonly. Go straight to mounting.
-	// Don't attempt to format if mounting as readonly. Go straight to mounting.
-	for _, option := range options {
-		if option == "ro" {
-			return mounter.Interface.Mount(source, target, fstype, options)
-		}
-	}
-	args := []string{}
-	// ext4 is the default for safe_format_and_mount
-	if len(fstype) > 0 && fstype != "ext4" {
-		args = append(args, "-m", fmt.Sprintf("mkfs.%s", fstype))
-	}
-	args = append(args, options...)
-	args = append(args, source, target)
-	glog.V(5).Infof("exec-ing: /usr/share/google/safe_format_and_mount %v", args)
-	cmd := mounter.runner.Command("/usr/share/google/safe_format_and_mount", args...)
-	dataOut, err := cmd.CombinedOutput()
-	if err != nil {
-		glog.V(5).Infof("error running /usr/share/google/safe_format_and_mount\n%s", string(dataOut))
-	}
-	return err
+	return awsCloudProvider, nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@ package serviceaccount
 import (
 	"fmt"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/validation"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/fielderrors"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/validation"
+	"k8s.io/kubernetes/pkg/fields"
+	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/validation/field"
 )
 
 // strategy implements behavior for ServiceAccount objects
@@ -42,19 +42,23 @@ func (strategy) NamespaceScoped() bool {
 	return true
 }
 
-func (strategy) PrepareForCreate(obj runtime.Object) {
+func (strategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
 	cleanSecretReferences(obj.(*api.ServiceAccount))
 }
 
-func (strategy) Validate(ctx api.Context, obj runtime.Object) fielderrors.ValidationErrorList {
+func (strategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
 	return validation.ValidateServiceAccount(obj.(*api.ServiceAccount))
+}
+
+// Canonicalize normalizes the object after validation.
+func (strategy) Canonicalize(obj runtime.Object) {
 }
 
 func (strategy) AllowCreateOnUpdate() bool {
 	return false
 }
 
-func (strategy) PrepareForUpdate(obj, old runtime.Object) {
+func (strategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
 	cleanSecretReferences(obj.(*api.ServiceAccount))
 }
 
@@ -64,8 +68,8 @@ func cleanSecretReferences(serviceAccount *api.ServiceAccount) {
 	}
 }
 
-func (strategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) fielderrors.ValidationErrorList {
-	return validation.ValidateServiceAccountUpdate(old.(*api.ServiceAccount), obj.(*api.ServiceAccount))
+func (strategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+	return validation.ValidateServiceAccountUpdate(obj.(*api.ServiceAccount), old.(*api.ServiceAccount))
 }
 
 func (strategy) AllowUnconditionalUpdate() bool {
@@ -73,20 +77,21 @@ func (strategy) AllowUnconditionalUpdate() bool {
 }
 
 // Matcher returns a generic matcher for a given label and field selector.
-func Matcher(label labels.Selector, field fields.Selector) generic.Matcher {
-	return generic.MatcherFunc(func(obj runtime.Object) (bool, error) {
-		sa, ok := obj.(*api.ServiceAccount)
-		if !ok {
-			return false, fmt.Errorf("not a serviceaccount")
-		}
-		fields := SelectableFields(sa)
-		return label.Matches(labels.Set(sa.Labels)) && field.Matches(fields), nil
-	})
+func Matcher(label labels.Selector, field fields.Selector) *generic.SelectionPredicate {
+	return &generic.SelectionPredicate{
+		Label: label,
+		Field: field,
+		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+			sa, ok := obj.(*api.ServiceAccount)
+			if !ok {
+				return nil, nil, fmt.Errorf("not a serviceaccount")
+			}
+			return labels.Set(sa.Labels), SelectableFields(sa), nil
+		},
+	}
 }
 
-// SelectableFields returns a label set that represents the object
-func SelectableFields(obj *api.ServiceAccount) labels.Set {
-	return labels.Set{
-		"metadata.name": obj.Name,
-	}
+// SelectableFields returns a field set that represents the object
+func SelectableFields(obj *api.ServiceAccount) fields.Set {
+	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
 }

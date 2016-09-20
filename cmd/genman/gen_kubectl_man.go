@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,13 +23,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/cmd/genutils"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd"
-	cmdutil "github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd/util"
-	"github.com/cpuguy83/go-md2man/mangen"
-	"github.com/russross/blackfriday"
+	mangen "github.com/cpuguy83/go-md2man/md2man"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/kubernetes/cmd/genutils"
+	"k8s.io/kubernetes/pkg/kubectl/cmd"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 )
 
 func main() {
@@ -51,7 +50,7 @@ func main() {
 	// Set environment variables used by kubectl so the output is consistent,
 	// regardless of where we run.
 	os.Setenv("HOME", "/home/username")
-	//TODO os.Stdin should really be something like ioutil.Discard, but a Reader
+	// TODO os.Stdin should really be something like ioutil.Discard, but a Reader
 	kubectl := cmd.NewKubectlCommand(cmdutil.NewFactory(nil), os.Stdin, ioutil.Discard, ioutil.Discard)
 	genMarkdown(kubectl, "", outDir)
 	for _, c := range kubectl.Commands() {
@@ -79,12 +78,16 @@ func printFlags(out *bytes.Buffer, flags *pflag.FlagSet) {
 			// put quotes on the value
 			format = "**--%s**=%q\n\t%s\n\n"
 		}
-		if len(flag.Shorthand) > 0 {
+
+		// Todo, when we mark a shorthand is deprecated, but specify an empty message.
+		// The flag.ShorthandDeprecated is empty as the shorthand is deprecated.
+		// Using len(flag.ShorthandDeprecated) > 0 can't handle this, others are ok.
+		if !(len(flag.ShorthandDeprecated) > 0) && len(flag.Shorthand) > 0 {
 			format = "**-%s**, " + format
+			fmt.Fprintf(out, format, flag.Shorthand, flag.Name, flag.DefValue, flag.Usage)
 		} else {
-			format = "%s" + format
+			fmt.Fprintf(out, format, flag.Name, flag.DefValue, flag.Usage)
 		}
-		fmt.Fprintf(out, format, flag.Shorthand, flag.Name, flag.DefValue, flag.Usage)
 	})
 }
 
@@ -144,17 +147,7 @@ func genMarkdown(command *cobra.Command, parent, docsDir string) {
 January 2015, Originally compiled by Eric Paris (eparis at redhat dot com) based on the kubernetes source material, but hopefully they have been automatically generated since!
 `)
 
-	renderer := mangen.ManRenderer(0)
-	extensions := 0
-	extensions |= blackfriday.EXTENSION_NO_INTRA_EMPHASIS
-	extensions |= blackfriday.EXTENSION_TABLES
-	extensions |= blackfriday.EXTENSION_FENCED_CODE
-	extensions |= blackfriday.EXTENSION_AUTOLINK
-	extensions |= blackfriday.EXTENSION_SPACE_HEADERS
-	extensions |= blackfriday.EXTENSION_FOOTNOTES
-	extensions |= blackfriday.EXTENSION_TITLEBLOCK
-
-	final := blackfriday.Markdown(out.Bytes(), renderer, extensions)
+	final := mangen.Render(out.Bytes())
 
 	filename := docsDir + dname + ".1"
 	outFile, err := os.Create(filename)

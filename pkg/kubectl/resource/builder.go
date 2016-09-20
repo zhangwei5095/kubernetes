@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,14 +23,20 @@ import (
 	"os"
 	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/meta"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/validation"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/errors"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/api/validation"
+	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/runtime"
+	utilerrors "k8s.io/kubernetes/pkg/util/errors"
+	"k8s.io/kubernetes/pkg/util/sets"
 )
+
+var FileExtensions = []string{".json", ".yaml", ".yml"}
+var InputExtensions = append(FileExtensions, "stdin")
+
+const defaultHttpGetAttempts int = 3
 
 // Builder provides convenience functions for taking arguments and parameters
 // from the command line and converting them to a list of resources to iterate
@@ -65,7 +71,31 @@ type Builder struct {
 	singleResourceType bool
 	continueOnError    bool
 
+	singular bool
+
+	export bool
+
 	schema validation.Schema
+}
+
+var missingResourceError = fmt.Errorf(`You must provide one or more resources by argument or filename.
+Example resource specifications include:
+   '-f rsrc.yaml'
+   '--filename=rsrc.json'
+   'pods my-pod'
+   'services'`)
+
+// TODO: expand this to include other errors.
+func IsUsageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err == missingResourceError
+}
+
+type FilenameOptions struct {
+	Filenames []string
+	Recursive bool
 }
 
 type resourceTuple struct {
@@ -74,9 +104,9 @@ type resourceTuple struct {
 }
 
 // NewBuilder creates a builder that operates on generic objects.
-func NewBuilder(mapper meta.RESTMapper, typer runtime.ObjectTyper, clientMapper ClientMapper) *Builder {
+func NewBuilder(mapper meta.RESTMapper, typer runtime.ObjectTyper, clientMapper ClientMapper, decoder runtime.Decoder) *Builder {
 	return &Builder{
-		mapper:        &Mapper{typer, mapper, clientMapper},
+		mapper:        &Mapper{typer, mapper, clientMapper, decoder},
 		requireObject: true,
 	}
 }
@@ -92,7 +122,9 @@ func (b *Builder) Schema(schema validation.Schema) *Builder {
 // will cause an error.
 // If ContinueOnError() is set prior to this method, objects on the path that are not
 // recognized will be ignored (but logged at V(2)).
-func (b *Builder) FilenameParam(enforceNamespace bool, paths ...string) *Builder {
+func (b *Builder) FilenameParam(enforceNamespace bool, filenameOptions *FilenameOptions) *Builder {
+	recursive := filenameOptions.Recursive
+	paths := filenameOptions.Filenames
 	for _, s := range paths {
 		switch {
 		case s == "-":
@@ -103,9 +135,12 @@ func (b *Builder) FilenameParam(enforceNamespace bool, paths ...string) *Builder
 				b.errs = append(b.errs, fmt.Errorf("the URL passed to filename %q is not valid: %v", s, err))
 				continue
 			}
-			b.URL(url)
+			b.URL(defaultHttpGetAttempts, url)
 		default:
-			b.Path(s)
+			if !recursive {
+				b.singular = true
+			}
+			b.Path(recursive, s)
 		}
 	}
 
@@ -117,12 +152,12 @@ func (b *Builder) FilenameParam(enforceNamespace bool, paths ...string) *Builder
 }
 
 // URL accepts a number of URLs directly.
-func (b *Builder) URL(urls ...*url.URL) *Builder {
+func (b *Builder) URL(httpAttemptCount int, urls ...*url.URL) *Builder {
 	for _, u := range urls {
 		b.paths = append(b.paths, &URLVisitor{
-			Mapper: b.mapper,
-			URL:    u,
-			Schema: b.schema,
+			URL:              u,
+			StreamVisitor:    NewStreamVisitor(nil, b.mapper, u.String(), b.schema),
+			HttpAttemptCount: httpAttemptCount,
 		})
 	}
 	return b
@@ -133,7 +168,7 @@ func (b *Builder) URL(urls ...*url.URL) *Builder {
 // will be ignored (but logged at V(2)).
 func (b *Builder) Stdin() *Builder {
 	b.stream = true
-	b.paths = append(b.paths, FileVisitorForSTDIN(b.mapper, b.continueOnError, b.schema))
+	b.paths = append(b.paths, FileVisitorForSTDIN(b.mapper, b.schema))
 	return b
 }
 
@@ -143,7 +178,7 @@ func (b *Builder) Stdin() *Builder {
 // will be ignored (but logged at V(2)).
 func (b *Builder) Stream(r io.Reader, name string) *Builder {
 	b.stream = true
-	b.paths = append(b.paths, NewStreamVisitor(r, b.mapper, name, b.continueOnError, b.schema))
+	b.paths = append(b.paths, NewStreamVisitor(r, b.mapper, name, b.schema))
 	return b
 }
 
@@ -152,7 +187,7 @@ func (b *Builder) Stream(r io.Reader, name string) *Builder {
 // FileVisitor is streaming the content to a StreamVisitor. If ContinueOnError() is set
 // prior to this method being called, objects on the path that are unrecognized will be
 // ignored (but logged at V(2)).
-func (b *Builder) Path(paths ...string) *Builder {
+func (b *Builder) Path(recursive bool, paths ...string) *Builder {
 	for _, p := range paths {
 		_, err := os.Stat(p)
 		if os.IsNotExist(err) {
@@ -164,7 +199,7 @@ func (b *Builder) Path(paths ...string) *Builder {
 			continue
 		}
 
-		visitors, err := ExpandPathsToFileVisitors(b.mapper, p, false, []string{".json", ".yaml", ".yml"}, b.continueOnError, b.schema)
+		visitors, err := ExpandPathsToFileVisitors(b.mapper, p, recursive, FileExtensions, b.schema)
 		if err != nil {
 			b.errs = append(b.errs, fmt.Errorf("error reading %q: %v", p, err))
 		}
@@ -181,6 +216,32 @@ func (b *Builder) Path(paths ...string) *Builder {
 // the server or retrieving objects that match a selector.
 func (b *Builder) ResourceTypes(types ...string) *Builder {
 	b.resources = append(b.resources, types...)
+	return b
+}
+
+// ResourceNames accepts a default type and one or more names, and creates tuples of
+// resources
+func (b *Builder) ResourceNames(resource string, names ...string) *Builder {
+	for _, name := range names {
+		// See if this input string is of type/name format
+		tuple, ok, err := splitResourceTypeName(name)
+		if err != nil {
+			b.errs = append(b.errs, err)
+			return b
+		}
+
+		if ok {
+			b.resourceTuples = append(b.resourceTuples, tuple)
+			continue
+		}
+		if len(resource) == 0 {
+			b.errs = append(b.errs, fmt.Errorf("the argument %q must be RESOURCE/NAME", name))
+			continue
+		}
+
+		// Use the given default type to create a resource tuple
+		b.resourceTuples = append(b.resourceTuples, resourceTuple{Resource: resource, Name: name})
+	}
 	return b
 }
 
@@ -206,6 +267,12 @@ func (b *Builder) SelectorParam(s string) *Builder {
 // Selector accepts a selector directly, and if non nil will trigger a list action.
 func (b *Builder) Selector(selector labels.Selector) *Builder {
 	b.selector = selector
+	return b
+}
+
+// ExportParam accepts the export boolean for these resources
+func (b *Builder) ExportParam(export bool) *Builder {
+	b.export = export
 	return b
 }
 
@@ -256,26 +323,27 @@ func (b *Builder) SelectAllParam(selectAll bool) *Builder {
 // When two or more arguments are received, they must be a single type and resource name(s).
 // The allowEmptySelector permits to select all the resources (via Everything func).
 func (b *Builder) ResourceTypeOrNameArgs(allowEmptySelector bool, args ...string) *Builder {
-	args = b.replaceAliases(args)
+	args = normalizeMultipleResourcesArgs(args)
 	if ok, err := hasCombinedTypeArgs(args); ok {
 		if err != nil {
 			b.errs = append(b.errs, err)
 			return b
 		}
 		for _, s := range args {
-			seg := strings.Split(s, "/")
-			if len(seg) != 2 {
-				b.errs = append(b.errs, fmt.Errorf("arguments in resource/name form may not have more than one slash"))
+			tuple, ok, err := splitResourceTypeName(s)
+			if err != nil {
+				b.errs = append(b.errs, err)
 				return b
 			}
-			resource, name := seg[0], seg[1]
-			if len(resource) == 0 || len(name) == 0 || len(SplitResourceArgument(resource)) != 1 {
-				b.errs = append(b.errs, fmt.Errorf("arguments in resource/name form must have a single resource and name"))
-				return b
+			if ok {
+				b.resourceTuples = append(b.resourceTuples, tuple)
 			}
-			b.resourceTuples = append(b.resourceTuples, resourceTuple{Resource: resource, Name: name})
 		}
 		return b
+	}
+	if len(args) > 0 {
+		// Try replacing aliases only in types
+		args[0] = b.ReplaceAliases(args[0])
 	}
 	switch {
 	case len(args) > 2:
@@ -291,21 +359,22 @@ func (b *Builder) ResourceTypeOrNameArgs(allowEmptySelector bool, args ...string
 		}
 	case len(args) == 0:
 	default:
-		b.errs = append(b.errs, fmt.Errorf("when passing arguments, must be resource or resource and name"))
+		b.errs = append(b.errs, fmt.Errorf("arguments must consist of a resource or a resource and name"))
 	}
 	return b
 }
 
-func (b *Builder) replaceAliases(args []string) []string {
+// ReplaceAliases accepts an argument and tries to expand any existing
+// aliases found in it
+func (b *Builder) ReplaceAliases(input string) string {
 	replaced := []string{}
-	for _, arg := range args {
+	for _, arg := range strings.Split(input, ",") {
 		if aliases, ok := b.mapper.AliasesForResource(arg); ok {
 			arg = strings.Join(aliases, ",")
 		}
 		replaced = append(replaced, arg)
 	}
-
-	return replaced
+	return strings.Join(replaced, ",")
 }
 
 func hasCombinedTypeArgs(args []string) (bool, error) {
@@ -319,24 +388,53 @@ func hasCombinedTypeArgs(args []string) (bool, error) {
 	case hasSlash > 0 && hasSlash == len(args):
 		return true, nil
 	case hasSlash > 0 && hasSlash != len(args):
-		return true, fmt.Errorf("when passing arguments in resource/name form, all arguments must include the resource")
+		baseCmd := "cmd"
+		if len(os.Args) > 0 {
+			baseCmdSlice := strings.Split(os.Args[0], "/")
+			baseCmd = baseCmdSlice[len(baseCmdSlice)-1]
+		}
+		return true, fmt.Errorf("there is no need to specify a resource type as a separate argument when passing arguments in resource/name form (e.g. '%s get resource/<resource_name>' instead of '%s get resource resource/<resource_name>'", baseCmd, baseCmd)
 	default:
 		return false, nil
 	}
 }
 
-// ResourceTypeAndNameArgs expects two arguments, a resource type, and a resource name. The resource
-// matching that type and and name will be retrieved from the server.
-func (b *Builder) ResourceTypeAndNameArgs(args ...string) *Builder {
-	switch len(args) {
-	case 2:
-		b.names = append(b.names, args[1])
-		b.ResourceTypes(SplitResourceArgument(args[0])...)
-	case 0:
-	default:
-		b.errs = append(b.errs, fmt.Errorf("when passing arguments, must be resource and name"))
+// Normalize args convert multiple resources to resource tuples, a,b,c d
+// as a transform to a/d b/d c/d
+func normalizeMultipleResourcesArgs(args []string) []string {
+	if len(args) >= 2 {
+		resources := []string{}
+		resources = append(resources, SplitResourceArgument(args[0])...)
+		if len(resources) > 1 {
+			names := []string{}
+			names = append(names, args[1:]...)
+			newArgs := []string{}
+			for _, resource := range resources {
+				for _, name := range names {
+					newArgs = append(newArgs, strings.Join([]string{resource, name}, "/"))
+				}
+			}
+			return newArgs
+		}
 	}
-	return b
+	return args
+}
+
+// splitResourceTypeName handles type/name resource formats and returns a resource tuple
+// (empty or not), whether it successfully found one, and an error
+func splitResourceTypeName(s string) (resourceTuple, bool, error) {
+	if !strings.Contains(s, "/") {
+		return resourceTuple{}, false, nil
+	}
+	seg := strings.Split(s, "/")
+	if len(seg) != 2 {
+		return resourceTuple{}, false, fmt.Errorf("arguments in resource/name form may not have more than one slash")
+	}
+	resource, name := seg[0], seg[1]
+	if len(resource) == 0 || len(name) == 0 || len(SplitResourceArgument(resource)) != 1 {
+		return resourceTuple{}, false, fmt.Errorf("arguments in resource/name form must have a single resource and name")
+	}
+	return resourceTuple{Resource: resource, Name: name}, true, nil
 }
 
 // Flatten will convert any objects with a field named "Items" that is an array of runtime.Object
@@ -374,20 +472,36 @@ func (b *Builder) SingleResourceType() *Builder {
 	return b
 }
 
+// mappingFor returns the RESTMapping for the Kind referenced by the resource.
+// prefers a fully specified GroupVersionResource match.  If we don't have one match on GroupResource
+func (b *Builder) mappingFor(resourceArg string) (*meta.RESTMapping, error) {
+	fullySpecifiedGVR, groupResource := unversioned.ParseResourceArg(resourceArg)
+	gvk := unversioned.GroupVersionKind{}
+	if fullySpecifiedGVR != nil {
+		gvk, _ = b.mapper.KindFor(*fullySpecifiedGVR)
+	}
+	if gvk.Empty() {
+		var err error
+		gvk, err = b.mapper.KindFor(groupResource.WithVersion(""))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return b.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+}
+
 func (b *Builder) resourceMappings() ([]*meta.RESTMapping, error) {
 	if len(b.resources) > 1 && b.singleResourceType {
 		return nil, fmt.Errorf("you may only specify a single resource type")
 	}
 	mappings := []*meta.RESTMapping{}
 	for _, r := range b.resources {
-		version, kind, err := b.mapper.VersionAndKindForResource(r)
+		mapping, err := b.mappingFor(r)
 		if err != nil {
 			return nil, err
 		}
-		mapping, err := b.mapper.RESTMapping(kind, version)
-		if err != nil {
-			return nil, err
-		}
+
 		mappings = append(mappings, mapping)
 	}
 	return mappings, nil
@@ -400,14 +514,11 @@ func (b *Builder) resourceTupleMappings() (map[string]*meta.RESTMapping, error) 
 		if _, ok := mappings[r.Resource]; ok {
 			continue
 		}
-		version, kind, err := b.mapper.VersionAndKindForResource(r.Resource)
+		mapping, err := b.mappingFor(r.Resource)
 		if err != nil {
 			return nil, err
 		}
-		mapping, err := b.mapper.RESTMapping(kind, version)
-		if err != nil {
-			return nil, err
-		}
+
 		mappings[mapping.Resource] = mapping
 		mappings[r.Resource] = mapping
 		canonical[mapping.Resource] = struct{}{}
@@ -420,7 +531,7 @@ func (b *Builder) resourceTupleMappings() (map[string]*meta.RESTMapping, error) 
 
 func (b *Builder) visitorResult() *Result {
 	if len(b.errs) > 0 {
-		return &Result{err: errors.NewAggregate(b.errs)}
+		return &Result{err: utilerrors.NewAggregate(b.errs)}
 	}
 
 	if b.selectAll {
@@ -461,7 +572,7 @@ func (b *Builder) visitorResult() *Result {
 			if mapping.Scope.Name() != meta.RESTScopeNameNamespace {
 				selectorNamespace = ""
 			}
-			visitors = append(visitors, NewSelector(client, mapping, selectorNamespace, b.selector))
+			visitors = append(visitors, NewSelector(client, mapping, selectorNamespace, b.selector, b.export))
 		}
 		if b.continueOnError {
 			return &Result{visitor: EagerVisitorList(visitors), sources: visitors}
@@ -471,7 +582,12 @@ func (b *Builder) visitorResult() *Result {
 
 	// visit items specified by resource and name
 	if len(b.resourceTuples) != 0 {
-		isSingular := len(b.resourceTuples) == 1
+		// if b.singular is false, this could be by default, so double-check length
+		// of resourceTuples to determine if in fact it is singular or not
+		isSingular := b.singular
+		if !isSingular {
+			isSingular = len(b.resourceTuples) == 1
+		}
 
 		if len(b.paths) != 0 {
 			return &Result{singular: isSingular, err: fmt.Errorf("when paths, URLs, or stdin is provided as input, you may not specify a resource by arguments as well")}
@@ -487,7 +603,7 @@ func (b *Builder) visitorResult() *Result {
 		}
 		clients := make(map[string]RESTClient)
 		for _, mapping := range mappings {
-			s := fmt.Sprintf("%s/%s", mapping.APIVersion, mapping.Resource)
+			s := fmt.Sprintf("%s/%s", mapping.GroupVersionKind.GroupVersion().String(), mapping.Resource)
 			if _, ok := clients[s]; ok {
 				continue
 			}
@@ -504,7 +620,7 @@ func (b *Builder) visitorResult() *Result {
 			if !ok {
 				return &Result{singular: isSingular, err: fmt.Errorf("resource %q is not recognized: %v", tuple.Resource, mappings)}
 			}
-			s := fmt.Sprintf("%s/%s", mapping.APIVersion, mapping.Resource)
+			s := fmt.Sprintf("%s/%s", mapping.GroupVersionKind.GroupVersion().String(), mapping.Resource)
 			client, ok := clients[s]
 			if !ok {
 				return &Result{singular: isSingular, err: fmt.Errorf("could not find a client for resource %q", tuple.Resource)}
@@ -519,7 +635,7 @@ func (b *Builder) visitorResult() *Result {
 				}
 			}
 
-			info := NewInfo(client, mapping, selectorNamespace, tuple.Name)
+			info := NewInfo(client, mapping, selectorNamespace, tuple.Name, b.export)
 			items = append(items, info)
 		}
 
@@ -568,7 +684,7 @@ func (b *Builder) visitorResult() *Result {
 
 		visitors := []Visitor{}
 		for _, name := range b.names {
-			info := NewInfo(client, mapping, selectorNamespace, name)
+			info := NewInfo(client, mapping, selectorNamespace, name, b.export)
 			visitors = append(visitors, info)
 		}
 		return &Result{singular: isSingular, visitor: VisitorList(visitors), sources: visitors}
@@ -594,12 +710,19 @@ func (b *Builder) visitorResult() *Result {
 			if b.flatten {
 				visitors = NewFlattenListVisitor(visitors, b.mapper)
 			}
+			// must set namespace prior to fetching
+			if b.defaultNamespace {
+				visitors = NewDecoratedVisitor(visitors, SetNamespace(b.namespace))
+			}
 			visitors = NewDecoratedVisitor(visitors, RetrieveLatest)
 		}
 		return &Result{singular: singular, visitor: visitors, sources: b.paths}
 	}
 
-	return &Result{err: fmt.Errorf("you must provide one or more resources by argument or filename")}
+	if len(b.resources) != 0 {
+		return &Result{err: fmt.Errorf("resource(s) were provided, but no name, label selector, or --all flag specified")}
+	}
+	return &Result{err: missingResourceError}
 }
 
 // Do returns a Result object with a Visitor for the resources identified by the Builder.
@@ -636,7 +759,7 @@ func (b *Builder) Do() *Result {
 // strings in the original order.
 func SplitResourceArgument(arg string) []string {
 	out := []string{}
-	set := util.NewStringSet()
+	set := sets.NewString()
 	for _, s := range strings.Split(arg, ",") {
 		if set.Has(s) {
 			continue
@@ -645,4 +768,14 @@ func SplitResourceArgument(arg string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// HasNames returns true if the provided args contain resource names
+func HasNames(args []string) (bool, error) {
+	args = normalizeMultipleResourcesArgs(args)
+	hasCombinedTypes, err := hasCombinedTypeArgs(args)
+	if err != nil {
+		return false, err
+	}
+	return hasCombinedTypes || len(args) > 1, nil
 }

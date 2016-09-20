@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/meta"
+	"k8s.io/kubernetes/pkg/api/meta"
 )
 
 // Store is a generic object storage interface. Reflector knows how to watch a server
@@ -43,7 +43,8 @@ type Store interface {
 	// Replace will delete the contents of the store, using instead the
 	// given list. Store takes ownership of the list, you should not reference
 	// it after calling this function.
-	Replace([]interface{}) error
+	Replace([]interface{}, string) error
+	Resync() error
 }
 
 // KeyFunc knows how to make a key from an object. Implementations should be deterministic.
@@ -80,10 +81,10 @@ func MetaNamespaceKeyFunc(obj interface{}) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("object has no meta: %v", err)
 	}
-	if len(meta.Namespace()) > 0 {
-		return meta.Namespace() + "/" + meta.Name(), nil
+	if len(meta.GetNamespace()) > 0 {
+		return meta.GetNamespace() + "/" + meta.GetName(), nil
 	}
-	return meta.Name(), nil
+	return meta.GetName(), nil
 }
 
 // SplitMetaNamespaceKey returns the namespace and name that
@@ -98,7 +99,7 @@ func SplitMetaNamespaceKey(key string) (namespace, name string, err error) {
 		// name only, no namespace
 		return "", parts[0], nil
 	case 2:
-		// name and namespace
+		// namespace and name
 		return parts[0], parts[1], nil
 	}
 
@@ -115,6 +116,8 @@ type cache struct {
 	// should be deterministic.
 	keyFunc KeyFunc
 }
+
+var _ Store = &cache{}
 
 // Add inserts an item into the cache.
 func (c *cache) Add(obj interface{}) error {
@@ -158,16 +161,34 @@ func (c *cache) ListKeys() []string {
 	return c.cacheStorage.ListKeys()
 }
 
+// GetIndexers returns the indexers of cache
+func (c *cache) GetIndexers() Indexers {
+	return c.cacheStorage.GetIndexers()
+}
+
 // Index returns a list of items that match on the index function
 // Index is thread-safe so long as you treat all items as immutable
 func (c *cache) Index(indexName string, obj interface{}) ([]interface{}, error) {
 	return c.cacheStorage.Index(indexName, obj)
 }
 
+// ListIndexFuncValues returns the list of generated values of an Index func
+func (c *cache) ListIndexFuncValues(indexName string) []string {
+	return c.cacheStorage.ListIndexFuncValues(indexName)
+}
+
+func (c *cache) ByIndex(indexName, indexKey string) ([]interface{}, error) {
+	return c.cacheStorage.ByIndex(indexName, indexKey)
+}
+
+func (c *cache) AddIndexers(newIndexers Indexers) error {
+	return c.cacheStorage.AddIndexers(newIndexers)
+}
+
 // Get returns the requested item, or sets exists=false.
 // Get is completely threadsafe as long as you treat all items as immutable.
 func (c *cache) Get(obj interface{}) (item interface{}, exists bool, err error) {
-	key, _ := c.keyFunc(obj)
+	key, err := c.keyFunc(obj)
 	if err != nil {
 		return nil, false, KeyError{obj, err}
 	}
@@ -184,7 +205,7 @@ func (c *cache) GetByKey(key string) (item interface{}, exists bool, err error) 
 // Replace will delete the contents of 'c', using instead the given list.
 // 'c' takes ownership of the list, you should not reference the list again
 // after calling this function.
-func (c *cache) Replace(list []interface{}) error {
+func (c *cache) Replace(list []interface{}, resourceVersion string) error {
 	items := map[string]interface{}{}
 	for _, item := range list {
 		key, err := c.keyFunc(item)
@@ -193,8 +214,13 @@ func (c *cache) Replace(list []interface{}) error {
 		}
 		items[key] = item
 	}
-	c.cacheStorage.Replace(items)
+	c.cacheStorage.Replace(items, resourceVersion)
 	return nil
+}
+
+// Resync touches all items in the store to force processing
+func (c *cache) Resync() error {
+	return c.cacheStorage.Resync()
 }
 
 // NewStore returns a Store implemented simply with a map and a lock.

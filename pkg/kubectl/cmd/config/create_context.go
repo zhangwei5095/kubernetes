@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,29 +21,32 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/renstrom/dedent"
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
-	clientcmdapi "github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	clientcmdapi "k8s.io/kubernetes/pkg/client/unversioned/clientcmd/api"
+	"k8s.io/kubernetes/pkg/util"
 )
 
 type createContextOptions struct {
-	configAccess ConfigAccess
+	configAccess clientcmd.ConfigAccess
 	name         string
 	cluster      util.StringFlag
 	authInfo     util.StringFlag
 	namespace    util.StringFlag
 }
 
-const (
-	create_context_long = `Sets a context entry in kubeconfig
-Specifying a name that already exists will merge new fields on top of existing values for those fields.`
-	create_context_example = `// Set the user field on the gce context entry without touching other values
-$ kubectl config set-context gce --user=cluster-admin`
+var (
+	create_context_long = dedent.Dedent(`
+		Sets a context entry in kubeconfig
+		Specifying a name that already exists will merge new fields on top of existing values for those fields.`)
+	create_context_example = dedent.Dedent(`
+		# Set the user field on the gce context entry without touching other values
+		kubectl config set-context gce --user=cluster-admin`)
 )
 
-func NewCmdConfigSetContext(out io.Writer, configAccess ConfigAccess) *cobra.Command {
+func NewCmdConfigSetContext(out io.Writer, configAccess clientcmd.ConfigAccess) *cobra.Command {
 	options := &createContextOptions{configAccess: configAccess}
 
 	cmd := &cobra.Command{
@@ -58,7 +61,9 @@ func NewCmdConfigSetContext(out io.Writer, configAccess ConfigAccess) *cobra.Com
 
 			err := options.run()
 			if err != nil {
-				fmt.Printf("%v\n", err)
+				fmt.Fprintf(out, "%v\n", err)
+			} else {
+				fmt.Fprintf(out, "context %q set.\n", options.name)
 			}
 		},
 	}
@@ -81,10 +86,14 @@ func (o createContextOptions) run() error {
 		return err
 	}
 
-	context := o.modifyContext(config.Contexts[o.name])
-	config.Contexts[o.name] = context
+	startingStanza, exists := config.Contexts[o.name]
+	if !exists {
+		startingStanza = clientcmdapi.NewContext()
+	}
+	context := o.modifyContext(*startingStanza)
+	config.Contexts[o.name] = &context
 
-	if err := ModifyConfig(o.configAccess, *config); err != nil {
+	if err := clientcmd.ModifyConfig(o.configAccess, *config, true); err != nil {
 		return err
 	}
 
@@ -120,7 +129,7 @@ func (o *createContextOptions) complete(cmd *cobra.Command) bool {
 
 func (o createContextOptions) validate() error {
 	if len(o.name) == 0 {
-		return errors.New("You must specify a non-empty context name")
+		return errors.New("you must specify a non-empty context name")
 	}
 
 	return nil

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,48 +17,57 @@ limitations under the License.
 package etcd
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/fields"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic"
-	etcdgeneric "github.com/GoogleCloudPlatform/kubernetes/pkg/registry/generic/etcd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/secret"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
+	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/registry/cachesize"
+	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/registry/generic/registry"
+	"k8s.io/kubernetes/pkg/registry/secret"
+	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/storage"
 )
 
-// REST implements a RESTStorage for secrets against etcd
 type REST struct {
-	*etcdgeneric.Etcd
+	*registry.Store
 }
 
-// NewStorage returns a registry which will store Secret in the given helper
-func NewStorage(h tools.EtcdHelper) *REST {
+// NewREST returns a RESTStorage object that will work against secrets.
+func NewREST(opts generic.RESTOptions) *REST {
+	prefix := "/" + opts.ResourcePrefix
 
-	prefix := "/secrets"
+	newListFunc := func() runtime.Object { return &api.SecretList{} }
+	storageInterface, dFunc := opts.Decorator(
+		opts.StorageConfig,
+		cachesize.GetWatchCacheSizeByResource(cachesize.Secrets),
+		&api.Secret{},
+		prefix,
+		secret.Strategy,
+		newListFunc,
+		storage.NoTriggerPublisher,
+	)
 
-	store := &etcdgeneric.Etcd{
+	store := &registry.Store{
 		NewFunc:     func() runtime.Object { return &api.Secret{} },
-		NewListFunc: func() runtime.Object { return &api.SecretList{} },
+		NewListFunc: newListFunc,
 		KeyRootFunc: func(ctx api.Context) string {
-			return etcdgeneric.NamespaceKeyRootFunc(ctx, prefix)
+			return registry.NamespaceKeyRootFunc(ctx, prefix)
 		},
 		KeyFunc: func(ctx api.Context, id string) (string, error) {
-			return etcdgeneric.NamespaceKeyFunc(ctx, prefix, id)
+			return registry.NamespaceKeyFunc(ctx, prefix, id)
 		},
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*api.Secret).Name, nil
 		},
-		PredicateFunc: func(label labels.Selector, field fields.Selector) generic.Matcher {
-			return secret.Matcher(label, field)
-		},
-		EndpointName: "secrets",
+		PredicateFunc:           secret.Matcher,
+		QualifiedResource:       api.Resource("secrets"),
+		EnableGarbageCollection: opts.EnableGarbageCollection,
+		DeleteCollectionWorkers: opts.DeleteCollectionWorkers,
 
-		Helper: h,
+		CreateStrategy: secret.Strategy,
+		UpdateStrategy: secret.Strategy,
+		DeleteStrategy: secret.Strategy,
+
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
-
-	store.CreateStrategy = secret.Strategy
-	store.UpdateStrategy = secret.Strategy
-
 	return &REST{store}
 }
